@@ -1,0 +1,128 @@
+name: Build & Release
+
+on:
+  schedule:
+    # Daily at 06:00 UTC — pick up new upstream tags
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Upstream tag to build (default: latest)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (patches + workflow)
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Clone upstream
+        run: |
+          git clone --quiet https://github.com/yoanbernabeu/grepai.git upstream
+          cd upstream && git fetch --tags --quiet
+
+      - name: Determine target tag
+        id: tag
+        run: |
+          cd upstream
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG=$(git tag -l 'v*' --sort=-v:refname | head -1)
+          fi
+          RELEASE_TAG="${TAG}+pulsar"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          echo "Target: upstream $TAG -> release $RELEASE_TAG"
+
+      - name: Skip if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.tag.outputs.release_tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.tag.outputs.release_tag }} already exists — skipping."
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout upstream tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cd upstream
+          git checkout --quiet "${{ steps.tag.outputs.tag }}"
+
+      - name: Apply pulsar patches
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cd upstream
+          shopt -s nullglob
+          patches=(../fork/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches found under fork/patches/ — aborting."
+            exit 1
+          fi
+          for p in "${patches[@]}"; do
+            echo "Applying $(basename "$p")"
+            git apply --verbose "$p"
+          done
+
+      - name: Setup Go
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+          cache: false
+
+      - name: Build linux/amd64 + linux/arm64
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cd upstream
+          mkdir -p ../dist
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w -X main.version=${{ steps.tag.outputs.release_tag }}" \
+            -o ../dist/grepai-linux-amd64 .
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+            go build -trimpath -ldflags="-s -w -X main.version=${{ steps.tag.outputs.release_tag }}" \
+            -o ../dist/grepai-linux-arm64 .
+          (cd ../dist && sha256sum * > SHA256SUMS)
+          ls -la ../dist
+
+      - name: Smoke-test binary
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          ./dist/grepai-linux-amd64 version || true
+          ./dist/grepai-linux-amd64 --help >/dev/null
+
+      - name: Create release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NOTES=$(cat <<EOF
+          Auto-built from upstream **${{ steps.tag.outputs.tag }}** with grepai-pulsar patches.
+
+          ## Patches applied
+          $(for p in fork/patches/*.patch; do echo "- \`$(basename "$p")\`"; done)
+
+          ## Configuration
+          - \`GREPAI_HTTP_TIMEOUT\` — embedder HTTP timeout (Go duration; default \`5m\`).
+            Upstream hardcodes 60s, which is too tight for Vertex/Bedrock-class backends.
+
+          Upstream release: https://github.com/yoanbernabeu/grepai/releases/tag/${{ steps.tag.outputs.tag }}
+          EOF
+          )
+          gh release create "${{ steps.tag.outputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.tag.outputs.release_tag }}" \
+            --notes "$NOTES" \
+            --target main \
+            dist/grepai-linux-amd64 dist/grepai-linux-arm64 dist/SHA256SUMS
