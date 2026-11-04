@@ -1077,21 +1077,21 @@ func runWatchDryRun(ctx context.Context, projectRoot string, cfg *config.Config,
 		return fmt.Errorf("dry run failed: %w", err)
 	}
 
-	println := func(format string, args ...any) {
+	report := func(format string, args ...any) {
 		if isBackgroundChild {
 			log.Printf(format, args...)
 		} else {
 			fmt.Printf(format+"\n", args...)
 		}
 	}
-	println("Scanned files: %d (skipped: %d)", stats.ScannedFiles, stats.FilesSkipped)
-	println("Files that would embed: %d; would remove: %d", stats.FilesToEmbed, stats.FilesRemoved)
-	println("Chunks cached: %d; chunks to embed: %d", stats.ChunksCached, stats.ChunksToEmbed)
-	println("Estimated tokens: %d (~%.1fM, ~$%.2f at $0.12/M)", stats.EstTokens, float64(stats.EstTokens)/1e6, float64(stats.EstTokens)/1e6*0.12)
+	report("Scanned files: %d (skipped: %d)", stats.ScannedFiles, stats.FilesSkipped)
+	report("Files that would embed: %d; would remove: %d", stats.FilesToEmbed, stats.FilesRemoved)
+	report("Chunks cached: %d; chunks to embed: %d", stats.ChunksCached, stats.ChunksToEmbed)
+	report("Estimated tokens: %d (~%.1fM, ~$%.2f at $0.12/M)", stats.EstTokens, float64(stats.EstTokens)/1e6, float64(stats.EstTokens)/1e6*0.12)
 	if len(stats.TopFiles) > 0 {
-		println("Top files by estimated tokens:")
+		report("Top files by estimated tokens:")
 		for _, f := range stats.TopFiles {
-			println("  %-60s chunks=%d cached=%d tokens~=%d", f.Path, f.ChunksCached+f.ChunksFresh, f.ChunksCached, f.EstTokens)
+			report("  %-60s chunks=%d cached=%d tokens~=%d", f.Path, f.ChunksCached+f.ChunksFresh, f.ChunksCached, f.EstTokens)
 		}
 	}
 	return nil
