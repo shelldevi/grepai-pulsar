@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/qdrant/go-client/qdrant"
 )
 
 func TestQdrantDocStore_RoundTrip(t *testing.T) {
@@ -64,5 +66,42 @@ func TestQdrantDocStore_LoadMissingIsEmpty(t *testing.T) {
 	// Persist with no changes must not create a file.
 	if err := s.persist(); err != nil {
 		t.Fatalf("clean persist must not fail: %v", err)
+	}
+}
+
+func TestPointVector_FlatAndOneofForms(t *testing.T) {
+	// Current servers return the deprecated flat Data field, not the oneof.
+	flat := &qdrant.RetrievedPoint{
+		Vectors: &qdrant.VectorsOutput{
+			VectorsOptions: &qdrant.VectorsOutput_Vector{
+				Vector: &qdrant.VectorOutput{Data: []float32{0.1, 0.2}},
+			},
+		},
+	}
+	if got := pointVector(flat); len(got) != 2 || got[0] != 0.1 {
+		t.Errorf("flat form not extracted: %v", got)
+	}
+
+	// The oneof form must keep working.
+	oneof := &qdrant.RetrievedPoint{
+		Vectors: &qdrant.VectorsOutput{
+			VectorsOptions: &qdrant.VectorsOutput_Vector{
+				Vector: &qdrant.VectorOutput{
+					Vector: &qdrant.VectorOutput_Dense{
+						Dense: &qdrant.DenseVector{Data: []float32{0.3, 0.4}},
+					},
+				},
+			},
+		},
+	}
+	if got := pointVector(oneof); len(got) != 2 || got[0] != 0.3 {
+		t.Errorf("oneof form not extracted: %v", got)
+	}
+
+	if pointVector(nil) != nil {
+		t.Error("nil point must yield nil vector")
+	}
+	if pointVector(&qdrant.RetrievedPoint{}) != nil {
+		t.Error("point without vectors must yield nil vector")
 	}
 }

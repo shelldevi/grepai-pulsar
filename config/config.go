@@ -226,6 +226,11 @@ func DefaultStoreForBackend(backend string) StoreConfig {
 
 type WatchConfig struct {
 	DebounceMs                  int       `yaml:"debounce_ms"`
+	// MaxWaitMs bounds how long filesystem events may be coalesced while
+	// the repo stays active. The debounce timer resets on every event, so
+	// without this a busy repo (or a very long debounce_ms) starves
+	// indexing indefinitely. Zero (the default) disables the bound.
+	MaxWaitMs                   int       `yaml:"max_wait_ms,omitempty"`
 	LastIndexTime               time.Time `yaml:"last_index_time,omitempty"`
 	RPGPersistIntervalMs        int       `yaml:"rpg_persist_interval_ms,omitempty"`
 	RPGDerivedDebounceMs        int       `yaml:"rpg_derived_debounce_ms,omitempty"`
@@ -286,6 +291,9 @@ func ValidateIndexerConfig(cfg IndexerConfig) error {
 
 // ValidateWatchConfig checks watch configuration values for validity.
 func ValidateWatchConfig(cfg WatchConfig) error {
+	if cfg.MaxWaitMs < 0 {
+		return fmt.Errorf("watch.max_wait_ms must be >= 0, got %d", cfg.MaxWaitMs)
+	}
 	if cfg.RPGPersistIntervalMs < 200 {
 		return fmt.Errorf("watch.rpg_persist_interval_ms must be >= 200, got %d", cfg.RPGPersistIntervalMs)
 	}

@@ -127,6 +127,25 @@ func sanitizeCollectionName(path string) string {
 	return strings.ReplaceAll(path, "/", "_")
 }
 
+// pointVector extracts the dense vector from a retrieved point. Current
+// Qdrant servers populate the deprecated flat Data field rather than the
+// VectorOutput oneof, so both forms must be handled: reading only the oneof
+// (GetDense) silently misses every cached vector and disables all
+// content-hash reuse.
+func pointVector(point *qdrant.RetrievedPoint) []float32 {
+	if point == nil || point.Vectors == nil {
+		return nil
+	}
+	vec := point.Vectors.GetVector()
+	if vec == nil {
+		return nil
+	}
+	if dense := vec.GetDense(); dense != nil {
+		return dense.GetData()
+	}
+	return vec.GetData()
+}
+
 func SanitizeCollectionName(path string) string {
 	return sanitizeCollectionName(path)
 }
@@ -502,11 +521,7 @@ func (s *QdrantStore) GetChunksForFile(ctx context.Context, filePath string) ([]
 	chunks := make([]Chunk, 0, len(scrollResult))
 	for _, point := range scrollResult {
 		chunk := s.parseChunkPayload(point.Payload)
-		if point.Vectors != nil && point.Vectors.GetVector() != nil {
-			if dense := point.Vectors.GetVector().GetDense(); dense != nil {
-				chunk.Vector = dense.GetData()
-			}
-		}
+		chunk.Vector = pointVector(point)
 		chunks = append(chunks, *chunk)
 	}
 
@@ -527,11 +542,7 @@ func (s *QdrantStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 	chunks := make([]Chunk, 0, len(scrollResult))
 	for _, point := range scrollResult {
 		chunk := s.parseChunkPayload(point.Payload)
-		if point.Vectors != nil && point.Vectors.GetVector() != nil {
-			if dense := point.Vectors.GetVector().GetDense(); dense != nil {
-				chunk.Vector = dense.GetData()
-			}
-		}
+		chunk.Vector = pointVector(point)
 		chunks = append(chunks, *chunk)
 	}
 
@@ -565,10 +576,8 @@ func (s *QdrantStore) LookupByContentHash(ctx context.Context, contentHash strin
 	}
 
 	point := scrollResult[0]
-	if point.Vectors != nil && point.Vectors.GetVector() != nil {
-		if dense := point.Vectors.GetVector().GetDense(); dense != nil {
-			return dense.GetData(), true, nil
-		}
+	if vec := pointVector(point); vec != nil {
+		return vec, true, nil
 	}
 
 	return nil, false, nil

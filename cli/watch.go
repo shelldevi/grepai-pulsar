@@ -1091,6 +1091,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	if err != nil {
 		return fmt.Errorf("failed to initialize watcher for %s: %w", projectRoot, err)
 	}
+	w.SetMaxWaitMs(cfg.Watch.MaxWaitMs)
 	defer w.Close()
 
 	if err := w.Start(ctx); err != nil {
@@ -2724,6 +2725,7 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		_ = symbolStore.Close()
 		return nil, nil, fmt.Errorf("failed to create watcher: %w", err)
 	}
+	w.SetMaxWaitMs(projectCfg.Watch.MaxWaitMs)
 	if err := w.Start(ctx); err != nil {
 		w.Close()
 		if rpgStore != nil {
