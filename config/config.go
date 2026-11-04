@@ -63,6 +63,7 @@ type Config struct {
 	Embedder          EmbedderConfig `yaml:"embedder"`
 	Store             StoreConfig    `yaml:"store"`
 	Chunking          ChunkingConfig `yaml:"chunking"`
+	Indexer           IndexerConfig  `yaml:"indexer,omitempty"`
 	Watch             WatchConfig    `yaml:"watch"`
 	Search            SearchConfig   `yaml:"search"`
 	Trace             TraceConfig    `yaml:"trace"`
@@ -198,6 +199,15 @@ type ChunkingConfig struct {
 	Overlap int `yaml:"overlap"`
 }
 
+// IndexerConfig holds file-selection settings for the indexer.
+type IndexerConfig struct {
+	// MaxFileSize caps the size of indexed files in bytes. Files larger
+	// than this are skipped with a log line. Zero (the default) keeps the
+	// built-in 1 MB limit, so existing configs behave exactly as before
+	// until an operator sets this key.
+	MaxFileSize int64 `yaml:"max_file_size,omitempty"`
+}
+
 func DefaultStoreForBackend(backend string) StoreConfig {
 	cfg := StoreConfig{Backend: backendOrDefault(backend)}
 	switch cfg.Backend {
@@ -262,6 +272,14 @@ func ValidateRPGConfig(cfg RPGConfig) error {
 		// valid
 	default:
 		return fmt.Errorf("rpg.feature_group_strategy must be one of: sample, split; got %q", cfg.FeatureGroupStrategy)
+	}
+	return nil
+}
+
+// ValidateIndexerConfig checks indexer file-selection settings.
+func ValidateIndexerConfig(cfg IndexerConfig) error {
+	if cfg.MaxFileSize < 0 {
+		return fmt.Errorf("indexer.max_file_size must be >= 0, got %d", cfg.MaxFileSize)
 	}
 	return nil
 }
@@ -430,6 +448,11 @@ func Load(projectRoot string) (*Config, error) {
 	// Validate watch timing configuration
 	if err := ValidateWatchConfig(cfg.Watch); err != nil {
 		return nil, fmt.Errorf("invalid watch configuration: %w", err)
+	}
+
+	// Validate indexer file-selection configuration
+	if err := ValidateIndexerConfig(cfg.Indexer); err != nil {
+		return nil, fmt.Errorf("invalid indexer configuration: %w", err)
 	}
 
 	// Validate RPG config when enabled

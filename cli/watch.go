@@ -451,10 +451,42 @@ func initializeStore(ctx context.Context, cfg *config.Config, projectRoot string
 		if collectionName == "" {
 			collectionName = store.SanitizeCollectionName(projectRoot)
 		}
-		return store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions())
+		return store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions(), qdrantDocPath(projectRoot))
 	default:
 		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Store.Backend)
 	}
+}
+
+// qdrantDocPath returns the sidecar path for Qdrant document metadata, or ""
+// when it cannot be determined. An empty path leaves the store without
+// document tracking (previous behavior); indexing still works via the
+// per-chunk content-hash cache, only file-level skip gates stay inactive.
+func qdrantDocPath(projectRoot string) string {
+	if projectRoot == "" {
+		return ""
+	}
+	return filepath.Join(projectRoot, ".grepai", "qdrant_docs.gob")
+}
+
+// workspaceQdrantDocPath returns the sidecar path for workspace-shared Qdrant
+// document metadata (next to the workspace config file), or "" when it
+// cannot be determined. Keys are project-prefixed, so one sidecar serves
+// all projects in the workspace.
+func workspaceQdrantDocPath(workspaceName string) string {
+	cfgPath, err := config.GetWorkspaceConfigPath()
+	if err != nil || workspaceName == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(cfgPath), "docmeta_"+workspaceName+".gob")
+}
+
+// applyMaxFileSize applies the optional indexer.max_file_size config key to
+// a scanner. Unset (0) keeps the scanner's built-in default.
+func applyMaxFileSize(scanner *indexer.Scanner, cfg *config.Config) {
+	if cfg == nil || scanner == nil {
+		return
+	}
+	scanner.SetMaxFileSize(cfg.Indexer.MaxFileSize)
 }
 
 const configWriteThrottle = 30 * time.Second
@@ -959,6 +991,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 
 	// Initialize scanner
 	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	applyMaxFileSize(scanner, cfg)
 
 	// Initialize chunker
 	chunker := indexer.NewChunker(cfg.Chunking.Size, cfg.Chunking.Overlap)
@@ -2607,6 +2640,7 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 	}
 
 	scanner := indexer.NewScanner(project.Path, ignoreMatcher)
+	applyMaxFileSize(scanner, projectCfg)
 	chunker := indexer.NewChunker(projectCfg.Chunking.Size, projectCfg.Chunking.Overlap)
 	vectorStore := &projectPrefixStore{
 		store:         sharedStore,
@@ -2728,7 +2762,7 @@ func initializeWorkspaceStore(ctx context.Context, ws *config.Workspace) (store.
 		if collectionName == "" {
 			collectionName = "workspace_" + ws.Name
 		}
-		return store.NewQdrantStore(ctx, ws.Store.Qdrant.Endpoint, ws.Store.Qdrant.Port, ws.Store.Qdrant.UseTLS, collectionName, ws.Store.Qdrant.APIKey, ws.Embedder.GetDimensions())
+		return store.NewQdrantStore(ctx, ws.Store.Qdrant.Endpoint, ws.Store.Qdrant.Port, ws.Store.Qdrant.UseTLS, collectionName, ws.Store.Qdrant.APIKey, ws.Embedder.GetDimensions(), workspaceQdrantDocPath(ws.Name))
 	default:
 		return nil, fmt.Errorf("unsupported backend for workspace: %s", ws.Store.Backend)
 	}

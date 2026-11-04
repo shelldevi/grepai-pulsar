@@ -25,6 +25,12 @@ type QdrantStore struct {
 	collectionName string
 	dimensions     int
 	apiKey         string
+	// docs holds file-level document metadata (file hash, chunk IDs). Qdrant
+	// point payloads carry chunk data only, so without this sidecar the
+	// indexer cannot tell an unchanged file from a changed one. It is nil
+	// unless the store was constructed with a document path — read-only
+	// consumers (search, status, MCP) leave it unset.
+	docs *qdrantDocStore
 }
 
 func parseHost(endpoint string) string {
@@ -42,7 +48,7 @@ func parseHost(endpoint string) string {
 	return host
 }
 
-func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool, collection, apiKey string, dimensions int) (*QdrantStore, error) {
+func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool, collection, apiKey string, dimensions int, docPath ...string) (*QdrantStore, error) {
 	host := parseHost(endpoint)
 
 	if port <= 0 {
@@ -68,6 +74,17 @@ func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool,
 
 	if err := store.ensureCollection(ctx); err != nil {
 		return nil, err
+	}
+
+	// Optional file-level document metadata. When set, GetDocument and
+	// friends serve real metadata so unchanged files are skipped; when
+	// unset, the previous stub behavior is kept for read-only consumers.
+	if len(docPath) > 0 && docPath[0] != "" {
+		docs := newQdrantDocStore(docPath[0])
+		if err := docs.load(); err != nil {
+			return nil, err
+		}
+		store.docs = docs
 	}
 
 	return store, nil
@@ -305,6 +322,14 @@ func (s *QdrantStore) parseChunkPayload(payload map[string]*qdrant.Value) *Chunk
 }
 
 func (s *QdrantStore) GetDocument(ctx context.Context, filePath string) (*Document, error) {
+	if s.docs != nil {
+		doc, ok := s.docs.get(filePath)
+		if !ok {
+			return nil, nil
+		}
+		return &doc, nil
+	}
+
 	filter := &qdrant.Filter{
 		Must: []*qdrant.Condition{
 			qdrant.NewMatch("file_path", filePath),
@@ -334,14 +359,26 @@ func (s *QdrantStore) GetDocument(ctx context.Context, filePath string) (*Docume
 }
 
 func (s *QdrantStore) SaveDocument(ctx context.Context, doc Document) error {
+	if s.docs != nil {
+		s.docs.set(doc)
+		return nil
+	}
 	return nil
 }
 
 func (s *QdrantStore) DeleteDocument(ctx context.Context, filePath string) error {
+	if s.docs != nil {
+		s.docs.del(filePath)
+		return nil
+	}
 	return nil
 }
 
 func (s *QdrantStore) ListDocuments(ctx context.Context) ([]string, error) {
+	if s.docs != nil {
+		return s.docs.list(), nil
+	}
+
 	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
 		CollectionName: s.collectionName,
 		Limit:          qdrant.PtrOf(uint32(1000)),
@@ -367,10 +404,16 @@ func (s *QdrantStore) ListDocuments(ctx context.Context) ([]string, error) {
 }
 
 func (s *QdrantStore) Load(ctx context.Context) error {
+	if s.docs != nil {
+		return s.docs.load()
+	}
 	return nil
 }
 
 func (s *QdrantStore) Persist(ctx context.Context) error {
+	if s.docs != nil {
+		return s.docs.persist()
+	}
 	return nil
 }
 

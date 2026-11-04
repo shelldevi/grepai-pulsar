@@ -216,28 +216,20 @@ type fileChunkData struct {
 	chunkInfos []ChunkInfo
 }
 
-// prepareFileChunks processes files by deleting existing chunks and creating new chunks.
-// Returns the file data for storage and the file chunks for embedding.
+// prepareFileChunks chunks files without touching the store. It must not
+// delete anything: the per-chunk cache lookups that follow reuse vectors
+// from the points this file (or another file) already has, and deleting
+// first would destroy exactly the vectors we want to reuse.
 func (idx *Indexer) prepareFileChunks(
 	ctx context.Context,
 	files []FileInfo,
-) ([]fileChunkData, []embedder.FileChunks, error) {
+) ([]fileChunkData, error) {
 	fileData := make([]fileChunkData, 0, len(files))
-	fileChunks := make([]embedder.FileChunks, 0, len(files))
 
 	for i, file := range files {
-		if err := idx.store.DeleteByFile(ctx, file.Path); err != nil {
-			return nil, nil, fmt.Errorf("failed to delete existing chunks for %s: %w", file.Path, err)
-		}
-
 		chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
 		if len(chunkInfos) == 0 {
 			continue
-		}
-
-		contents := make([]string, len(chunkInfos))
-		for j, c := range chunkInfos {
-			contents[j] = c.Content
 		}
 
 		fileData = append(fileData, fileChunkData{
@@ -245,14 +237,9 @@ func (idx *Indexer) prepareFileChunks(
 			file:       file,
 			chunkInfos: chunkInfos,
 		})
-
-		fileChunks = append(fileChunks, embedder.FileChunks{
-			FileIndex: i,
-			Chunks:    contents,
-		})
 	}
 
-	return fileData, fileChunks, nil
+	return fileData, nil
 }
 
 // createStoreChunks creates store.Chunk objects from chunk info and embeddings.
@@ -319,112 +306,144 @@ func wrapBatchProgress(onProgress BatchProgressCallback) embedder.BatchProgress 
 // indexFilesBatched indexes multiple files using cross-file batch embedding.
 // It collects chunks from all files, forms batches, embeds them in parallel,
 // then maps results back and stores them.
+//
+// Chunk reuse works per chunk, not per file: only chunks whose content hash
+// is not found in the store are sent to the embedder. Cached vectors are
+// stored under the new chunk positions, so a one-line edit re-embeds 1-2
+// chunks instead of the whole file.
+//
+// A failed cache lookup aborts the whole batch before any embedding call:
+// a lookup failure usually means the store is unreachable, and embedding
+// anyway would pay for vectors that then fail to save.
 func (idx *Indexer) indexFilesBatched(
 	ctx context.Context,
 	files []FileInfo,
 	batchEmb embedder.BatchEmbedder,
 	onProgress BatchProgressCallback,
 ) (filesIndexed int, chunksCreated int, err error) {
-	fileData, fileChunks, err := idx.prepareFileChunks(ctx, files)
+	fileData, err := idx.prepareFileChunks(ctx, files)
 	if err != nil {
 		return 0, 0, err
 	}
 
-	if len(fileChunks) == 0 {
+	if len(fileData) == 0 {
 		return 0, 0, nil
 	}
 
-	// Check embedding cache for content-addressed deduplication
-	cache, hasCache := idx.store.(store.EmbeddingCache)
+	// Look up every chunk before touching the store: deletes happen only
+	// after all lookups succeed, so lookups can still hit the vectors that
+	// are about to be replaced.
+	type uncachedRef struct {
+		fdIndex  int // index into fileData
+		chunkIdx int // index into fd.chunkInfos
+	}
+	cachedVecs := make([]map[int][]float32, len(fileData))
+	var uncached []uncachedRef
 	var totalCacheHits int
 
-	// Pre-fill cached embeddings and filter out fully-cached files
-	type preFilled struct {
-		fdIndex   int
-		vectors   [][]float32
-		allCached bool
-	}
-
-	var preFilledFiles []preFilled
-	var remainingFileData []fileChunkData
-	var remainingFileChunks []embedder.FileChunks
-
-	for i, fd := range fileData {
-		if !hasCache {
-			remainingFileData = append(remainingFileData, fd)
-			remainingFileChunks = append(remainingFileChunks, fileChunks[i])
-			continue
-		}
-
-		vecs := make([][]float32, len(fd.chunkInfos))
-		allCached := true
-		for j, chunk := range fd.chunkInfos {
-			if chunk.ContentHash == "" {
-				allCached = false
-				continue
-			}
-			vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
-			if err != nil {
-				log.Printf("Warning: cache lookup failed: %v", err)
-				allCached = false
-				continue
-			}
-			if found {
-				vecs[j] = vec
-				totalCacheHits++
-			} else {
-				allCached = false
+	if cache, hasCache := idx.store.(store.EmbeddingCache); hasCache {
+		for i, fd := range fileData {
+			cachedVecs[i] = make(map[int][]float32)
+			for j, chunk := range fd.chunkInfos {
+				if chunk.ContentHash == "" {
+					uncached = append(uncached, uncachedRef{fdIndex: i, chunkIdx: j})
+					continue
+				}
+				vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
+				if err != nil {
+					return filesIndexed, chunksCreated, fmt.Errorf(
+						"embedding cache lookup failed for %s (chunk %d): %w — aborting batch before any paid embedding",
+						fd.file.Path, j, err)
+				}
+				if found {
+					cachedVecs[i][j] = vec
+					totalCacheHits++
+				} else {
+					uncached = append(uncached, uncachedRef{fdIndex: i, chunkIdx: j})
+				}
 			}
 		}
-
-		if allCached {
-			preFilledFiles = append(preFilledFiles, preFilled{fdIndex: i, vectors: vecs, allCached: true})
-		} else {
-			remainingFileData = append(remainingFileData, fd)
-			remainingFileChunks = append(remainingFileChunks, fileChunks[i])
+	} else {
+		for i, fd := range fileData {
+			for j := range fd.chunkInfos {
+				uncached = append(uncached, uncachedRef{fdIndex: i, chunkIdx: j})
+			}
 		}
 	}
 
 	if totalCacheHits > 0 {
-		log.Printf("Reused %d cached embeddings across %d files", totalCacheHits, len(preFilledFiles))
+		log.Printf("Reused %d cached embeddings across %d files", totalCacheHits, len(fileData))
 	}
 
-	// Save fully-cached files immediately
+	// Embed only the uncached chunks.
 	now := time.Now()
-	for _, pf := range preFilledFiles {
-		fd := fileData[pf.fdIndex]
-		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, pf.vectors, now)
-		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
-			return filesIndexed, chunksCreated, err
+	freshVecs := make([][]float32, len(uncached)) // parallel to uncached
+	if len(uncached) > 0 {
+		remaining := make([]embedder.FileChunks, 0, len(fileData))
+		// remainingPos[fdIdx][k] is the uncached index of the k-th chunk
+		// sent for file fdIdx, so results map back unambiguously.
+		remainingPos := make([][]int, len(fileData))
+		byFile := make(map[int][]int)
+		for u, ref := range uncached {
+			byFile[ref.fdIndex] = append(byFile[ref.fdIndex], u)
 		}
-		filesIndexed++
-		chunksCreated += len(chunks)
-	}
+		for fdIdx, us := range byFile {
+			fc := embedder.FileChunks{FileIndex: fdIdx}
+			for _, u := range us {
+				ref := uncached[u]
+				fc.Chunks = append(fc.Chunks, fileData[ref.fdIndex].chunkInfos[ref.chunkIdx].Content)
+				remainingPos[fdIdx] = append(remainingPos[fdIdx], u)
+			}
+			remaining = append(remaining, fc)
+		}
 
-	// Embed remaining (non-cached) files
-	if len(remainingFileChunks) > 0 {
-		batches := embedder.FormBatches(remainingFileChunks)
+		batches := embedder.FormBatches(remaining)
 		results, err := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress))
 		if err != nil {
 			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", err)
 		}
 
-		fileEmbeddings := embedder.MapResultsToFiles(batches, results, len(files))
-
-		for _, fd := range remainingFileData {
-			embeddings := fileEmbeddings[fd.fileIndex]
-			if len(embeddings) != len(fd.chunkInfos) {
-				log.Printf("Warning: embedding count mismatch for %s: got %d, expected %d",
-					fd.file.Path, len(embeddings), len(fd.chunkInfos))
-				continue
+		fileEmbeddings := embedder.MapResultsToFiles(batches, results, len(fileData))
+		for fdIdx, us := range remainingPos {
+			for pos, u := range us {
+				if pos >= len(fileEmbeddings[fdIdx]) || fileEmbeddings[fdIdx][pos] == nil {
+					return filesIndexed, chunksCreated, fmt.Errorf(
+						"missing embedding for %s (chunk %d): aborting batch to avoid storing a partial file",
+						fileData[fdIdx].file.Path, uncached[u].chunkIdx)
+				}
+				freshVecs[u] = fileEmbeddings[fdIdx][pos]
 			}
-			chunks, chunkIDs := createStoreChunks(fd.chunkInfos, embeddings, now)
-			if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
-				return filesIndexed, chunksCreated, err
-			}
-			filesIndexed++
-			chunksCreated += len(chunks)
 		}
+	}
+
+	// Merge cached and fresh vectors, then replace each file's chunks.
+	// Deletes happen only after all embedding succeeded: an embed failure
+	// leaves the previous index intact instead of an empty file.
+	freshByFile := make([]map[int][]float32, len(fileData))
+	for u, ref := range uncached {
+		if freshByFile[ref.fdIndex] == nil {
+			freshByFile[ref.fdIndex] = make(map[int][]float32)
+		}
+		freshByFile[ref.fdIndex][ref.chunkIdx] = freshVecs[u]
+	}
+	for i, fd := range fileData {
+		if err := idx.store.DeleteByFile(ctx, fd.file.Path); err != nil {
+			return filesIndexed, chunksCreated, fmt.Errorf("failed to delete existing chunks for %s: %w", fd.file.Path, err)
+		}
+		vectors := make([][]float32, len(fd.chunkInfos))
+		for j := range fd.chunkInfos {
+			if v, ok := cachedVecs[i][j]; ok {
+				vectors[j] = v
+			} else {
+				vectors[j] = freshByFile[i][j]
+			}
+		}
+		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, vectors, now)
+		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+			return filesIndexed, chunksCreated, err
+		}
+		filesIndexed++
+		chunksCreated += len(chunks)
 	}
 
 	return filesIndexed, chunksCreated, nil
@@ -434,13 +453,16 @@ func (idx *Indexer) indexFilesBatched(
 // before giving up on a file.
 const maxReChunkAttempts = 3
 
-// IndexFile indexes a single file
+// IndexFile indexes a single file.
+//
+// Order matters: chunk and look up cached vectors BEFORE deleting anything,
+// so lookups can still hit the vectors being replaced. Deletion and saving
+// happen only after all embedding succeeded, so an embed failure leaves the
+// previous index intact instead of an empty file. A cache lookup failure
+// aborts before any embedding call — it usually means the store is
+// unreachable, and embedding anyway would pay for vectors that then fail
+// to save.
 func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
-	// Remove existing chunks for this file
-	if err := idx.store.DeleteByFile(ctx, file.Path); err != nil {
-		return 0, fmt.Errorf("failed to delete existing chunks: %w", err)
-	}
-
 	// Chunk the file
 	chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
 	if len(chunkInfos) == 0 {
@@ -448,7 +470,10 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 	}
 
 	// Check embedding cache for content-addressed deduplication
-	cachedVectors, cacheHits := idx.lookupCachedEmbeddings(ctx, chunkInfos)
+	cachedVectors, cacheHits, err := idx.lookupCachedEmbeddings(ctx, file.Path, chunkInfos)
+	if err != nil {
+		return 0, err
+	}
 	if cacheHits > 0 {
 		log.Printf("Reused %d cached embeddings for %s", cacheHits, file.Path)
 	}
@@ -535,6 +560,11 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 			UpdatedAt:   now,
 		}
 		chunkIDs[i] = info.ID
+	}
+
+	// Replace the file's chunks only after embedding succeeded.
+	if err := idx.store.DeleteByFile(ctx, file.Path); err != nil {
+		return 0, fmt.Errorf("failed to delete existing chunks for %s: %w", file.Path, err)
 	}
 
 	// Save chunks
@@ -627,10 +657,14 @@ func (idx *Indexer) embedWithReChunking(ctx context.Context, chunks []ChunkInfo)
 // lookupCachedEmbeddings checks if the store implements EmbeddingCache and returns
 // cached vectors for chunks with matching content hashes. The returned map maps
 // chunk index to cached vector. Chunks not in the map need fresh embedding.
-func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkInfo) (map[int][]float32, int) {
+//
+// A lookup failure is returned as an error (fail closed): it usually means
+// the store is unreachable, and falling back to embedding would pay for
+// vectors that then fail to save.
+func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, filePath string, chunks []ChunkInfo) (map[int][]float32, int, error) {
 	cache, ok := idx.store.(store.EmbeddingCache)
 	if !ok {
-		return nil, 0
+		return nil, 0, nil
 	}
 
 	cached := make(map[int][]float32)
@@ -640,15 +674,14 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, chunks []ChunkIn
 		}
 		vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
 		if err != nil {
-			log.Printf("Warning: cache lookup failed for content hash %s: %v", chunk.ContentHash[:8], err)
-			continue
+			return nil, 0, fmt.Errorf("embedding cache lookup failed for %s (chunk %d): %w — aborting before any paid embedding", filePath, i, err)
 		}
 		if found {
 			cached[i] = vec
 		}
 	}
 
-	return cached, len(cached)
+	return cached, len(cached), nil
 }
 
 // RemoveFile removes a file from the index

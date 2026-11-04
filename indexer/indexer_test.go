@@ -454,6 +454,10 @@ func TestIndexAllWithProgress_DeletedFilesRemoved(t *testing.T) {
 type mockBatchEmbedder struct {
 	embedCalled bool
 	delay       time.Duration // Optional delay per batch for testing concurrency
+	batchCalls  int           // Number of EmbedBatches calls (cache-behavior tests)
+	batchInputs [][]string    // Contents sent per EmbedBatches call (cache-behavior tests)
+	batchErr    error         // Returned by EmbedBatches when set (fail-closed tests)
+	embedErr    error         // Returned by Embed/EmbedBatch when set (failure tests)
 }
 
 func newMockBatchEmbedder() *mockBatchEmbedder {
@@ -462,11 +466,17 @@ func newMockBatchEmbedder() *mockBatchEmbedder {
 
 func (m *mockBatchEmbedder) Embed(ctx context.Context, text string) ([]float32, error) {
 	m.embedCalled = true
+	if m.embedErr != nil {
+		return nil, m.embedErr
+	}
 	return []float32{0.1, 0.2, 0.3}, nil
 }
 
 func (m *mockBatchEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	m.embedCalled = true
+	if m.embedErr != nil {
+		return nil, m.embedErr
+	}
 	vectors := make([][]float32, len(texts))
 	for i := range texts {
 		vectors[i] = []float32{0.1, 0.2, 0.3}
@@ -484,6 +494,10 @@ func (m *mockBatchEmbedder) Close() error {
 
 func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder.Batch, progress embedder.BatchProgress) ([]embedder.BatchResult, error) {
 	m.embedCalled = true
+	m.batchCalls++
+	if m.batchErr != nil {
+		return nil, m.batchErr
+	}
 
 	// Calculate total chunks for progress reporting
 	totalChunks := 0
@@ -498,6 +512,7 @@ func (m *mockBatchEmbedder) EmbedBatches(ctx context.Context, batches []embedder
 		if m.delay > 0 {
 			time.Sleep(m.delay)
 		}
+		m.batchInputs = append(m.batchInputs, batch.Contents())
 
 		// Create mock embeddings
 		embeddings := make([][]float32, batch.Size())
@@ -776,16 +791,13 @@ func TestPrepareFileChunks(t *testing.T) {
 			{Path: "file2.go", Content: "package util\n\nfunc helper() {}", Hash: "hash2", ModTime: 1001},
 		}
 
-		fileData, fileChunks, err := indexer.prepareFileChunks(ctx, files)
+		fileData, err := indexer.prepareFileChunks(ctx, files)
 		if err != nil {
 			t.Fatalf("prepareFileChunks failed: %v", err)
 		}
 
 		if len(fileData) != 2 {
 			t.Errorf("expected 2 fileData entries, got %d", len(fileData))
-		}
-		if len(fileChunks) != 2 {
-			t.Errorf("expected 2 fileChunks entries, got %d", len(fileChunks))
 		}
 
 		// Verify file indices are preserved
@@ -795,9 +807,10 @@ func TestPrepareFileChunks(t *testing.T) {
 			}
 		}
 
-		// Verify DeleteByFile was called
-		if !mockStore.delByFileCalled {
-			t.Error("expected DeleteByFile to be called")
+		// prepareFileChunks must not touch the store: cache lookups that
+		// follow reuse the vectors that deletion would otherwise destroy.
+		if mockStore.delByFileCalled {
+			t.Error("prepareFileChunks must not call DeleteByFile; deletion happens after embedding")
 		}
 	})
 
@@ -807,7 +820,7 @@ func TestPrepareFileChunks(t *testing.T) {
 			{Path: "file.go", Content: "package main\n\nfunc main() {}", Hash: "hash2", ModTime: 1001},
 		}
 
-		fileData, fileChunks, err := indexer.prepareFileChunks(ctx, files)
+		fileData, err := indexer.prepareFileChunks(ctx, files)
 		if err != nil {
 			t.Fatalf("prepareFileChunks failed: %v", err)
 		}
@@ -816,22 +829,16 @@ func TestPrepareFileChunks(t *testing.T) {
 		if len(fileData) != 1 {
 			t.Errorf("expected 1 fileData entry (empty file skipped), got %d", len(fileData))
 		}
-		if len(fileChunks) != 1 {
-			t.Errorf("expected 1 fileChunks entry, got %d", len(fileChunks))
-		}
 	})
 
 	t.Run("returns empty slices for empty input", func(t *testing.T) {
-		fileData, fileChunks, err := indexer.prepareFileChunks(ctx, []FileInfo{})
+		fileData, err := indexer.prepareFileChunks(ctx, []FileInfo{})
 		if err != nil {
 			t.Fatalf("prepareFileChunks failed: %v", err)
 		}
 
 		if len(fileData) != 0 {
 			t.Errorf("expected 0 fileData entries, got %d", len(fileData))
-		}
-		if len(fileChunks) != 0 {
-			t.Errorf("expected 0 fileChunks entries, got %d", len(fileChunks))
 		}
 	})
 }

@@ -352,3 +352,47 @@ func TestScanner_ScanFile_SkipsMinified(t *testing.T) {
 		t.Error("expected nil for minified file, got file info")
 	}
 }
+
+func TestScanner_MaxFileSizeOverride(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	testFile := filepath.Join(tmpDir, "big.go")
+	filler := make([]byte, 2000)
+	for i := range filler {
+		filler[i] = 'x'
+	}
+	content := "package main\n\n// " + string(filler) + "\nfunc main() {}\n"
+	if err := os.WriteFile(testFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	// Default limit (1 MB) accepts the file.
+	scanner := NewScanner(tmpDir, ignoreMatcher)
+	if scanner.MaxFileSize() != 1024*1024 {
+		t.Errorf("expected default 1 MB limit, got %d", scanner.MaxFileSize())
+	}
+	if fi, err := scanner.ScanFile("big.go"); err != nil || fi == nil {
+		t.Fatalf("expected default limit to accept file, got %v %v", fi, err)
+	}
+
+	// A configured smaller limit skips it.
+	scanner.SetMaxFileSize(100)
+	if scanner.MaxFileSize() != 100 {
+		t.Errorf("expected overridden limit 100, got %d", scanner.MaxFileSize())
+	}
+	if fi, err := scanner.ScanFile("big.go"); err != nil || fi != nil {
+		t.Errorf("expected oversized file to be skipped, got %v %v", fi, err)
+	}
+
+	// Non-positive values keep the current limit (unset key = no change).
+	scanner.SetMaxFileSize(0)
+	scanner.SetMaxFileSize(-5)
+	if scanner.MaxFileSize() != 100 {
+		t.Errorf("expected limit to stay 100 after unset/invalid, got %d", scanner.MaxFileSize())
+	}
+}

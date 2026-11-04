@@ -680,3 +680,35 @@ func TestValidateWatchConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateIndexerConfig(t *testing.T) {
+	if err := ValidateIndexerConfig(IndexerConfig{}); err != nil {
+		t.Errorf("unset max_file_size must be valid, got %v", err)
+	}
+	if err := ValidateIndexerConfig(IndexerConfig{MaxFileSize: 1024}); err != nil {
+		t.Errorf("positive max_file_size must be valid, got %v", err)
+	}
+	if err := ValidateIndexerConfig(IndexerConfig{MaxFileSize: -1}); err == nil {
+		t.Error("negative max_file_size must be rejected")
+	}
+}
+
+func TestIndexerMaxFileSize_YAMLRoundTrip(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Indexer.MaxFileSize != 0 {
+		t.Fatalf("default config must leave max_file_size unset, got %d", cfg.Indexer.MaxFileSize)
+	}
+	cfg.Indexer.MaxFileSize = 50 * 1024 * 1024
+
+	tmpDir := t.TempDir()
+	if err := cfg.Save(tmpDir); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+	loaded, err := Load(tmpDir)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if loaded.Indexer.MaxFileSize != 50*1024*1024 {
+		t.Errorf("expected max_file_size to survive round-trip, got %d", loaded.Indexer.MaxFileSize)
+	}
+}

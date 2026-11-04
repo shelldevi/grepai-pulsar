@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,9 @@ import (
 )
 
 const (
-	maxFileSize = 1 * 1024 * 1024 // 1 MB
+	// defaultMaxFileSize is the built-in upper bound for indexed files.
+	// It applies until the operator sets indexer.max_file_size in config.
+	defaultMaxFileSize = 1 * 1024 * 1024 // 1 MB
 )
 
 // MinifiedPatterns lists patterns for minified files to skip by default
@@ -112,15 +115,37 @@ type FileMeta struct {
 }
 
 type Scanner struct {
-	root   string
-	ignore *IgnoreMatcher
+	root        string
+	ignore      *IgnoreMatcher
+	maxFileSize int64
 }
 
 func NewScanner(root string, ignore *IgnoreMatcher) *Scanner {
 	return &Scanner{
-		root:   root,
-		ignore: ignore,
+		root:        root,
+		ignore:      ignore,
+		maxFileSize: defaultMaxFileSize,
 	}
+}
+
+// SetMaxFileSize overrides the built-in file size limit (in bytes).
+// Values <= 0 keep the built-in default, so an unset config key changes
+// nothing. Called by the CLI from indexer.max_file_size.
+func (s *Scanner) SetMaxFileSize(size int64) {
+	if size > 0 {
+		s.maxFileSize = size
+	}
+}
+
+// MaxFileSize returns the effective per-file size limit in bytes.
+func (s *Scanner) MaxFileSize() int64 {
+	return s.maxFileSize
+}
+
+// logSkipSize reports a file skipped for exceeding the size limit. Skips
+// otherwise stay silent, so an operator-set limit needs this to be visible.
+func (s *Scanner) logSkipSize(relPath string, size int64) {
+	log.Printf("Skipping %s: size %d bytes exceeds max file size %d bytes", relPath, size, s.maxFileSize)
 }
 
 // ScanMetadata scans indexable files and returns only file metadata.
@@ -170,7 +195,8 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 		}
 
 		// Skip large files
-		if info.Size() > maxFileSize {
+		if info.Size() > s.maxFileSize {
+			s.logSkipSize(relPath, info.Size())
 			skipped = append(skipped, relPath+" (too large)")
 			return nil
 		}
@@ -232,7 +258,8 @@ func (s *Scanner) Scan() ([]FileInfo, []string, error) {
 		}
 
 		// Skip large files
-		if info.Size() > maxFileSize {
+		if info.Size() > s.maxFileSize {
+			s.logSkipSize(relPath, info.Size())
 			skipped = append(skipped, relPath+" (too large)")
 			return nil
 		}
@@ -278,8 +305,9 @@ func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
 		return nil, err
 	}
 
-	if info.Size() > maxFileSize {
-		return nil, nil // Skip large files
+	if info.Size() > s.maxFileSize {
+		s.logSkipSize(relPath, info.Size())
+		return nil, nil // Skip large file
 	}
 
 	content, err := os.ReadFile(absPath)
