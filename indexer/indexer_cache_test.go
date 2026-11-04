@@ -3,6 +3,8 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/yoanbernabeu/grepai/store"
@@ -312,5 +314,56 @@ func TestReconcileStoredChunks(t *testing.T) {
 	}
 	if !st.delIDsCalled && len(st.delIDs) != 0 {
 		t.Error("expected no deletions on clean state")
+	}
+}
+
+func TestDryRun_PreviewsWithoutEmbeddingOrWriting(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	content := "package main\n\nfunc alpha() { println(\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\") }\n"
+	if err := os.WriteFile(filepath.Join(tmpDir, "file.go"), []byte(content), 0644); err != nil {
+		t.Fatalf("failed to create test file: %v", err)
+	}
+	st := &cacheMockStore{mockStore: *newMockStore(), lookupVecs: map[string][]float32{}}
+	emb := newMockBatchEmbedder()
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+	idx := &Indexer{
+		root:     tmpDir,
+		store:    st,
+		embedder: emb,
+		chunker:  NewChunker(64, 8),
+		scanner:  NewScanner(tmpDir, ignoreMatcher),
+	}
+
+	infos := NewChunker(64, 8).ChunkWithContext("file.go", content)
+	if len(infos) == 0 {
+		t.Fatal("need chunks for this test")
+	}
+	// Pretend all but the first chunk are already indexed.
+	for _, ci := range infos[1:] {
+		st.lookupVecs[ci.ContentHash] = cachedVec(7)
+	}
+
+	stats, err := idx.DryRun(ctx, nil)
+	if err != nil {
+		t.Fatalf("DryRun failed: %v", err)
+	}
+	if stats.FilesToEmbed != 1 {
+		t.Errorf("expected 1 file to embed, got %d", stats.FilesToEmbed)
+	}
+	if stats.ChunksToEmbed != 1 || stats.ChunksCached != len(infos)-1 {
+		t.Errorf("expected 1 fresh + %d cached chunks, got %+v", len(infos)-1, stats)
+	}
+	if stats.EstTokens <= 0 {
+		t.Error("expected positive token estimate")
+	}
+	if emb.embedCalled || emb.batchCalls > 0 {
+		t.Fatal("dry run must not call the embedder")
+	}
+	if st.saveChunksCalled || st.delByFileCalled || st.delIDsCalled || st.saveDocCalled || st.delDocCalled {
+		t.Fatal("dry run must not write anything to the store")
 	}
 }

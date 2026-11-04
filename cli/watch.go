@@ -35,6 +35,7 @@ var (
 	watchStop       bool
 	watchWorkspace  string
 	watchNoUI       bool
+	watchDryRun     bool
 )
 
 var (
@@ -84,6 +85,7 @@ func init() {
 	watchCmd.Flags().BoolVar(&watchStop, "stop", false, "Stop the background watcher")
 	watchCmd.Flags().StringVar(&watchWorkspace, "workspace", "", "Workspace name for multi-project mode")
 	watchCmd.Flags().BoolVar(&watchNoUI, "no-ui", false, "Disable interactive UI in foreground mode")
+	watchCmd.Flags().BoolVar(&watchDryRun, "dry-run", false, "Preview a scan: report files/chunks that would be embedded and estimated tokens, without embedding or writing anything")
 }
 
 func runWatch(cmd *cobra.Command, args []string) error {
@@ -98,8 +100,14 @@ func runWatch(cmd *cobra.Command, args []string) error {
 	if watchStop {
 		activeFlags++
 	}
+	if watchDryRun {
+		activeFlags++
+	}
 	if activeFlags > 1 {
-		return fmt.Errorf("flags --background, --status, and --stop are mutually exclusive")
+		return fmt.Errorf("flags --background, --status, --stop and --dry-run are mutually exclusive")
+	}
+	if watchDryRun && watchWorkspace != "" {
+		return fmt.Errorf("--dry-run does not support workspace mode; run it per project directory")
 	}
 
 	// Determine log directory
@@ -984,6 +992,109 @@ func canonicalPath(path string) string {
 		path = abs
 	}
 	return filepath.Clean(path)
+}
+
+// initializeStoreReadOnly opens the store without creating anything: no
+// collection creation, no field indexes, no schema DDL. Used by --dry-run,
+// which must not write anywhere.
+func initializeStoreReadOnly(ctx context.Context, cfg *config.Config, projectRoot string) (store.VectorStore, error) {
+	switch cfg.Store.Backend {
+	case "gob":
+		indexPath := config.GetIndexPath(projectRoot)
+		gobStore := store.NewGOBStore(indexPath)
+		if err := gobStore.Load(ctx); err != nil {
+			return nil, fmt.Errorf("failed to load index: %w", err)
+		}
+		return gobStore, nil
+	case "postgres":
+		return store.NewPostgresStoreReadOnly(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions())
+	case "qdrant":
+		collectionName := cfg.Store.Qdrant.Collection
+		if collectionName == "" {
+			collectionName = store.SanitizeCollectionName(projectRoot)
+		}
+		st, err := store.NewQdrantStoreReadOnly(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions(), qdrantDocPath(projectRoot))
+		if err != nil {
+			return nil, err
+		}
+		st.SetFingerprint(store.CacheFingerprint{
+			Model:        cfg.Embedder.Model,
+			Dimensions:   cfg.Embedder.GetDimensions(),
+			ChunkSize:    cfg.Chunking.Size,
+			ChunkOverlap: cfg.Chunking.Overlap,
+			Collection:   collectionName,
+		})
+		return st, nil
+	default:
+		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Store.Backend)
+	}
+}
+
+// isMissingCollectionErr reports whether err is the read-only store's
+// missing-collection refusal (as opposed to a connection failure, which
+// must still abort loudly).
+func isMissingCollectionErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "read-only mode, refusing to create it")
+}
+
+// runWatchDryRun previews the next scan: which files would be embedded,
+// how many chunks hit the cache, and the estimated token cost. It performs
+// no embedding and no writes of any kind (no store writes, no sidecar
+// persist, no config save, no watcher).
+func runWatchDryRun(ctx context.Context, projectRoot string, cfg *config.Config, isBackgroundChild bool) error {
+	if !isBackgroundChild {
+		fmt.Printf("Dry run: scanning %s (no embedding, no writes)\n", projectRoot)
+	} else {
+		log.Printf("Dry run: scanning %s (no embedding, no writes)", projectRoot)
+	}
+
+	st, err := initializeStoreReadOnly(ctx, cfg, projectRoot)
+	if err != nil {
+		// A missing collection means a fresh project: nothing is cached,
+		// so everything would embed. Preview against an empty in-memory
+		// store instead of failing.
+		if !isMissingCollectionErr(err) || cfg.Store.Backend != "qdrant" {
+			return err
+		}
+		log.Printf("Dry run: collection does not exist yet, previewing full initial index")
+		st = store.NewGOBStore("")
+	}
+	defer st.Close()
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, cfg.Ignore, cfg.ExternalGitignore)
+	if err != nil {
+		return fmt.Errorf("failed to initialize ignore matcher: %w", err)
+	}
+
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	applyMaxFileSize(scanner, cfg)
+	chunker := indexer.NewChunker(cfg.Chunking.Size, cfg.Chunking.Overlap)
+	// No embedder: DryRun never embeds. Nil is safe because it is never called.
+	idx := indexer.NewIndexer(projectRoot, st, nil, chunker, scanner, cfg.Watch.LastIndexTime)
+
+	stats, err := idx.DryRun(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("dry run failed: %w", err)
+	}
+
+	println := func(format string, args ...any) {
+		if isBackgroundChild {
+			log.Printf(format, args...)
+		} else {
+			fmt.Printf(format+"\n", args...)
+		}
+	}
+	println("Scanned files: %d (skipped: %d)", stats.ScannedFiles, stats.FilesSkipped)
+	println("Files that would embed: %d; would remove: %d", stats.FilesToEmbed, stats.FilesRemoved)
+	println("Chunks cached: %d; chunks to embed: %d", stats.ChunksCached, stats.ChunksToEmbed)
+	println("Estimated tokens: %d (~%.1fM, ~$%.2f at $0.12/M)", stats.EstTokens, float64(stats.EstTokens)/1e6, float64(stats.EstTokens)/1e6*0.12)
+	if len(stats.TopFiles) > 0 {
+		println("Top files by estimated tokens:")
+		for _, f := range stats.TopFiles {
+			println("  %-60s chunks=%d cached=%d tokens~=%d", f.Path, f.ChunksCached+f.ChunksFresh, f.ChunksCached, f.EstTokens)
+		}
+	}
+	return nil
 }
 
 // watchProject runs the full watch lifecycle for a single project.
@@ -1924,6 +2035,11 @@ func runWatchForeground() error {
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+
+	// Dry run: preview only, no embedding, no writes, no watcher.
+	if watchDryRun {
+		return runWatchDryRun(ctx, projectRoot, cfg, isBackgroundChild)
 	}
 
 	if !isBackgroundChild {

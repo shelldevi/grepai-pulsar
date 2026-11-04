@@ -17,6 +17,16 @@ type PostgresStore struct {
 }
 
 func NewPostgresStore(ctx context.Context, dsn string, projectID string, vectorDimensions int) (*PostgresStore, error) {
+	return newPostgresStore(ctx, dsn, projectID, vectorDimensions, true)
+}
+
+// NewPostgresStoreReadOnly connects without ensuring the schema, for
+// read-only flows (e.g. scan --dry-run) that must not write anything.
+func NewPostgresStoreReadOnly(ctx context.Context, dsn string, projectID string, vectorDimensions int) (*PostgresStore, error) {
+	return newPostgresStore(ctx, dsn, projectID, vectorDimensions, false)
+}
+
+func newPostgresStore(ctx context.Context, dsn string, projectID string, vectorDimensions int, ensure bool) (*PostgresStore, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
@@ -28,11 +38,12 @@ func NewPostgresStore(ctx context.Context, dsn string, projectID string, vectorD
 		dimensions: vectorDimensions,
 	}
 
-	if err := store.ensureSchema(ctx); err != nil {
-		pool.Close()
-		return nil, err
+	if ensure {
+		if err := store.ensureSchema(ctx); err != nil {
+			pool.Close()
+			return nil, err
+		}
 	}
-
 	return store, nil
 }
 

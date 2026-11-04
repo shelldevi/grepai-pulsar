@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/yoanbernabeu/grepai/embedder"
@@ -80,19 +81,34 @@ func (idx *Indexer) IndexAllWithProgress(ctx context.Context, onProgress Progres
 	return idx.IndexAllWithBatchProgress(ctx, onProgress, nil)
 }
 
-// IndexAllWithBatchProgress performs a full index with both file and batch progress reporting.
-// When the embedder implements BatchEmbedder, files are processed in parallel using cross-file batching.
-func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress ProgressCallback, onBatchProgress BatchProgressCallback) (*IndexStats, error) {
-	start := time.Now()
-	stats := &IndexStats{}
+// fileSelection is the result of deciding what a scan would do, without
+// doing it. Shared by the real index pass and the dry-run preview so both
+// can never disagree on file selection.
+type fileSelection struct {
+	filesToIndex []FileInfo // changed/new files to (re-)index
+	excludeNow   []string   // still on disk but newly excluded (remove promptly)
+	gone         []string   // in the store but gone from disk (remove at end)
+	skipped      int        // skipped entries (too large, unchanged, errors)
+	scannedFiles []FileMeta // all files found during scan
+}
+
+// toRemove returns every path the selection would delete.
+func (s *fileSelection) toRemove() []string {
+	return append(append([]string{}, s.excludeNow...), s.gone...)
+}
+
+// selectFilesForIndex runs the metadata pass and the mod-time/file-hash
+// gates. It performs no store writes and no embedding.
+func (idx *Indexer) selectFilesForIndex(ctx context.Context, onProgress ProgressCallback) (*fileSelection, error) {
+	sel := &fileSelection{}
 
 	// Scan all files (metadata-only first pass)
 	fileMetas, skipped, err := idx.scanner.ScanMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan files: %w", err)
 	}
-	stats.FilesSkipped = len(skipped)
-	stats.ScannedFiles = fileMetas
+	sel.skipped = len(skipped)
+	sel.scannedFiles = fileMetas
 
 	// Get existing documents
 	existingDocs, err := idx.store.ListDocuments(ctx)
@@ -106,7 +122,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 
 	// Filter files that need indexing
-	filesToIndex := make([]FileInfo, 0, len(fileMetas))
+	sel.filesToIndex = make([]FileInfo, 0, len(fileMetas))
 	for i, fileMeta := range fileMetas {
 		// Report progress for scanning phase
 		if onProgress != nil {
@@ -129,7 +145,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		if !idx.lastIndexTime.IsZero() && doc != nil && len(doc.ChunkIDs) > 0 {
 			fileModTime := time.Unix(fileMeta.ModTime, 0)
 			if fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime) {
-				stats.FilesSkipped++
+				sel.skipped++
 				delete(existingMap, fileMeta.Path)
 				continue
 			}
@@ -139,19 +155,13 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		file, err := idx.scanner.ScanFile(fileMeta.Path)
 		if err != nil {
 			log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
-			stats.FilesSkipped++
+			sel.skipped++
 			delete(existingMap, fileMeta.Path)
 			continue
 		}
 		if file == nil {
-			// Excluded since last index (too large, binary, minified):
-			// drop stale chunks and documents instead of keeping them.
-			log.Printf("Removing %s from index: file is now excluded (too large, binary or minified)", fileMeta.Path)
-			if rerr := idx.RemoveFile(ctx, fileMeta.Path); rerr != nil {
-				log.Printf("Failed to remove %s: %v", fileMeta.Path, rerr)
-			} else {
-				stats.FilesRemoved++
-			}
+			// Excluded since last index (too large, binary, minified).
+			sel.excludeNow = append(sel.excludeNow, fileMeta.Path)
 			delete(existingMap, fileMeta.Path)
 			continue
 		}
@@ -161,10 +171,51 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			continue // File unchanged and has chunks
 		}
 
-		filesToIndex = append(filesToIndex, *file)
+		sel.filesToIndex = append(sel.filesToIndex, *file)
 		delete(existingMap, fileMeta.Path)
 	}
 
+	// Whatever is left in the store is gone from disk.
+	for path := range existingMap {
+		sel.gone = append(sel.gone, path)
+	}
+
+	return sel, nil
+}
+
+// IndexAllWithBatchProgress performs a full index with both file and batch progress reporting.
+// When the embedder implements BatchEmbedder, files are processed in parallel using cross-file batching.
+func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress ProgressCallback, onBatchProgress BatchProgressCallback) (*IndexStats, error) {
+	start := time.Now()
+	stats := &IndexStats{}
+
+	sel, err := idx.selectFilesForIndex(ctx, onProgress)
+	if err != nil {
+		return nil, err
+	}
+	stats.FilesSkipped = sel.skipped
+	stats.ScannedFiles = sel.scannedFiles
+	filesToIndex := sel.filesToIndex
+
+	// Drop newly-excluded files first, exactly where the old inline loop did.
+	for _, path := range sel.excludeNow {
+		log.Printf("Removing %s from index: file is now excluded (too large, binary or minified)", path)
+		if rerr := idx.RemoveFile(ctx, path); rerr != nil {
+			log.Printf("Failed to remove %s: %v", path, rerr)
+		} else {
+			stats.FilesRemoved++
+		}
+	}
+
+	// Drop newly-excluded files first, exactly where the old inline loop did.
+	for _, path := range sel.excludeNow {
+		log.Printf("Removing %s from index: file is now excluded (too large, binary or minified)", path)
+		if rerr := idx.RemoveFile(ctx, path); rerr != nil {
+			log.Printf("Failed to remove %s: %v", path, rerr)
+		} else {
+			stats.FilesRemoved++
+		}
+	}
 	// Index files using batch processing if available, otherwise sequentially
 	if batchEmbedder, ok := idx.embedder.(embedder.BatchEmbedder); ok && len(filesToIndex) > 0 {
 		indexed, chunks, err := idx.indexFilesBatched(ctx, filesToIndex, batchEmbedder, onBatchProgress)
@@ -204,7 +255,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 
 	// Remove deleted files
-	for path := range existingMap {
+	for _, path := range sel.gone {
 		if err := idx.RemoveFile(ctx, path); err != nil {
 			log.Printf("Failed to remove %s: %v", path, err)
 			continue
@@ -213,6 +264,95 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 
 	stats.Duration = time.Since(start)
+	return stats, nil
+}
+
+// DryRunFile is the per-file preview of what a scan would embed.
+type DryRunFile struct {
+	Path         string
+	ChunksCached int
+	ChunksFresh  int
+	EstTokens    int
+}
+
+// DryRunStats previews a scan: what would be embedded and at what token
+// cost, without embedding anything or writing anything (no store writes,
+// no sidecar persist). Lookups are read-only; a lookup error still aborts,
+// so a failing store cannot hide behind the preview.
+type DryRunStats struct {
+	FilesToEmbed  int
+	ChunksCached  int
+	ChunksToEmbed int
+	EstTokens     int
+	FilesRemoved  int
+	FilesSkipped  int
+	ScannedFiles  int
+	TopFiles      []DryRunFile
+}
+
+// DryRunMaxTopFiles caps the per-file table in DryRunStats.
+const DryRunMaxTopFiles = 15
+
+// DryRun previews the next index pass. It uses the same file selection as
+// IndexAllWithBatchProgress, then chunks each file and performs only the
+// read-only cache lookups, summing estimated tokens for the misses.
+func (idx *Indexer) DryRun(ctx context.Context, onProgress ProgressCallback) (*DryRunStats, error) {
+	sel, err := idx.selectFilesForIndex(ctx, onProgress)
+	if err != nil {
+		return nil, err
+	}
+
+	stats := &DryRunStats{
+		FilesRemoved: len(sel.toRemove()),
+		FilesSkipped: sel.skipped,
+		ScannedFiles: len(sel.scannedFiles),
+	}
+
+	cache, hasCache := idx.store.(store.EmbeddingCache)
+	for _, file := range sel.filesToIndex {
+		chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
+		if len(chunkInfos) == 0 {
+			continue
+		}
+		df := DryRunFile{Path: file.Path}
+		for _, chunk := range chunkInfos {
+			if chunk.ContentHash == "" {
+				df.ChunksFresh++
+				df.EstTokens += embedder.EstimateTokens(chunk.Content)
+				continue
+			}
+			if !hasCache {
+				df.ChunksFresh++
+				df.EstTokens += embedder.EstimateTokens(chunk.Content)
+				continue
+			}
+			_, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash, file.Path)
+			if err != nil {
+				return nil, fmt.Errorf("embedding cache lookup failed for %s: %w (dry run aborts like the real pass)", file.Path, err)
+			}
+			if found {
+				df.ChunksCached++
+			} else {
+				df.ChunksFresh++
+				df.EstTokens += embedder.EstimateTokens(chunk.Content)
+			}
+		}
+		if df.ChunksFresh > 0 {
+			stats.FilesToEmbed++
+		}
+		stats.ChunksCached += df.ChunksCached
+		stats.ChunksToEmbed += df.ChunksFresh
+		stats.EstTokens += df.EstTokens
+		stats.TopFiles = append(stats.TopFiles, df)
+	}
+
+	sort.Slice(stats.TopFiles, func(i, j int) bool {
+		return stats.TopFiles[i].EstTokens > stats.TopFiles[j].EstTokens
+	})
+	if len(stats.TopFiles) > DryRunMaxTopFiles {
+		stats.TopFiles = stats.TopFiles[:DryRunMaxTopFiles]
+	}
+
 	return stats, nil
 }
 
@@ -762,6 +902,13 @@ func (idx *Indexer) ReconcileStoredChunks(ctx context.Context) (int, error) {
 
 		have := make(map[string]bool, len(chunks))
 		for _, c := range chunks {
+			// Points written before chunk IDs were stored carry no ID and
+			// cannot be verified: skip them here (a count mismatch still
+			// drops the document below, and the re-queue's stale cleanup
+			// removes them by document ID).
+			if c.ID == "" {
+				continue
+			}
 			have[c.ID] = true
 		}
 		want := make(map[string]bool, len(doc.ChunkIDs))

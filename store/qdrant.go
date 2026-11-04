@@ -54,6 +54,17 @@ func parseHost(endpoint string) string {
 }
 
 func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool, collection, apiKey string, dimensions int, docPath ...string) (*QdrantStore, error) {
+	return newQdrantStore(ctx, endpoint, port, useTLS, collection, apiKey, dimensions, true, docPath)
+}
+
+// NewQdrantStoreReadOnly connects without creating the collection or the
+// content_hash field index, for read-only flows (e.g. scan --dry-run) that
+// must not write anything. It fails if the collection does not exist.
+func NewQdrantStoreReadOnly(ctx context.Context, endpoint string, port int, useTLS bool, collection, apiKey string, dimensions int, docPath ...string) (*QdrantStore, error) {
+	return newQdrantStore(ctx, endpoint, port, useTLS, collection, apiKey, dimensions, false, docPath)
+}
+
+func newQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool, collection, apiKey string, dimensions int, ensure bool, docPath []string) (*QdrantStore, error) {
 	host := parseHost(endpoint)
 
 	if port <= 0 {
@@ -77,7 +88,7 @@ func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool,
 		apiKey:         apiKey,
 	}
 
-	created, err := store.ensureCollection(ctx)
+	created, err := store.ensureCollection(ctx, ensure)
 	if err != nil {
 		return nil, err
 	}
@@ -135,7 +146,11 @@ func (s *QdrantStore) SetFingerprint(fp CacheFingerprint) {
 	s.cacheDisabled = true
 }
 
-func (s *QdrantStore) ensureCollection(ctx context.Context) (bool, error) {
+// ensureCollection verifies the collection exists. With ensure=true it is
+// created (with the content_hash field index) when missing; with ensure=false
+// (read-only flows) a missing collection is an error and nothing is written.
+// Returns whether the collection was created by this call.
+func (s *QdrantStore) ensureCollection(ctx context.Context, ensure bool) (bool, error) {
 	exists, err := s.client.CollectionExists(ctx, s.collectionName)
 	if err != nil {
 		return false, fmt.Errorf("failed to check collection existence: %w", err)
@@ -143,6 +158,9 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) (bool, error) {
 
 	created := false
 	if !exists {
+		if !ensure {
+			return false, fmt.Errorf("collection %s does not exist (read-only mode, refusing to create it)", s.collectionName)
+		}
 		if s.dimensions <= 0 {
 			return false, fmt.Errorf("dimensions must be positive, got: %d", s.dimensions)
 		}
@@ -160,12 +178,15 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) (bool, error) {
 	}
 
 	// Create field index for content_hash to enable efficient lookups.
-	// Error is intentionally ignored because the index may already exist.
-	_, _ = s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
-		CollectionName: s.collectionName,
-		FieldName:      "content_hash",
-		FieldType:      qdrant.PtrOf(qdrant.FieldType_FieldTypeKeyword),
-	})
+	// Skipped in read-only mode; error is otherwise intentionally ignored
+	// because the index may already exist.
+	if ensure {
+		_, _ = s.client.CreateFieldIndex(ctx, &qdrant.CreateFieldIndexCollection{
+			CollectionName: s.collectionName,
+			FieldName:      "content_hash",
+			FieldType:      qdrant.PtrOf(qdrant.FieldType_FieldTypeKeyword),
+		})
+	}
 
 	return created, nil
 }
@@ -274,6 +295,14 @@ func (s *QdrantStore) buildChunkPayload(chunk Chunk) (map[string]*qdrant.Value, 
 	payload["hash"] = hashVal
 	payload["updated_at"] = updatedAtVal
 
+	// The point ID is a one-way UUID of this value, so store it explicitly:
+	// reconciliation and callers need the original chunk ID back.
+	chunkIDVal, err := qdrant.NewValue(chunk.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create chunk_id value: %w", err)
+	}
+	payload["chunk_id"] = chunkIDVal
+
 	if chunk.ContentHash != "" {
 		contentHashVal, err := qdrant.NewValue(chunk.ContentHash)
 		if err != nil {
@@ -352,7 +381,7 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 		CollectionName: s.collectionName,
 		Query:          qdrant.NewQuery(queryVector...),
 		Limit:          qdrant.PtrOf(fetchLimitU64),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at"),
+		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at", "chunk_id"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to search: %w", err)
@@ -383,6 +412,9 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 
 func (s *QdrantStore) parseChunkPayload(payload map[string]*qdrant.Value) *Chunk {
 	chunk := &Chunk{}
+	if val, ok := payload["chunk_id"]; ok {
+		chunk.ID = val.GetStringValue()
+	}
 	if val, ok := payload["file_path"]; ok {
 		chunk.FilePath = val.GetStringValue()
 	}
@@ -582,7 +614,7 @@ func (s *QdrantStore) GetChunksForFile(ctx context.Context, filePath string) ([]
 		CollectionName: s.collectionName,
 		Filter:         filter,
 		Limit:          qdrant.PtrOf(uint32(10000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at"),
+		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at", "chunk_id"),
 		WithVectors:    qdrant.NewWithVectors(true),
 	})
 	if err != nil {
@@ -603,7 +635,7 @@ func (s *QdrantStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 	scrollResult, err := s.client.Scroll(ctx, &qdrant.ScrollPoints{
 		CollectionName: s.collectionName,
 		Limit:          qdrant.PtrOf(uint32(100000)),
-		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at"),
+		WithPayload:    qdrant.NewWithPayloadInclude("file_path", "start_line", "end_line", "content", "hash", "updated_at", "chunk_id"),
 		WithVectors:    qdrant.NewWithVectors(true),
 	})
 	if err != nil {

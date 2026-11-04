@@ -192,3 +192,15 @@ func TestQdrantStore_SetFingerprintDisablesCacheOnMismatch(t *testing.T) {
 		t.Fatalf("disabled cache must miss cleanly, got %v %v", found, err)
 	}
 }
+
+func TestPointVector_ChunkIDRoundTrip(t *testing.T) {
+	qs := &QdrantStore{}
+	ch := Chunk{ID: "f.go_3", FilePath: "f.go", StartLine: 1, EndLine: 2, Content: "x", Hash: "h", ContentHash: "c"}
+	payload, err := qs.buildChunkPayload(ch)
+	if err != nil {
+		t.Fatalf("buildChunkPayload failed: %v", err)
+	}
+	if got := qs.parseChunkPayload(payload).ID; got != "f.go_3" {
+		t.Errorf("chunk ID did not survive payload round-trip, got %q", got)
+	}
+}
