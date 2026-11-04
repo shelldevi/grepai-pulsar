@@ -153,13 +153,11 @@ func (m *mockStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, 
 }
 
 func (m *mockStore) GetChunksForFile(ctx context.Context, filePath string) ([]store.Chunk, error) {
-	doc, ok := m.documents[filePath]
-	if !ok {
-		return nil, nil
-	}
-	chunks := make([]store.Chunk, 0, len(doc.ChunkIDs))
-	for _, id := range doc.ChunkIDs {
-		if chunk, ok := m.chunks[id]; ok {
+	// Scan by file path like the real backends do (not via the document),
+	// so orphan points invisible to the document are still returned.
+	chunks := make([]store.Chunk, 0)
+	for _, chunk := range m.chunks {
+		if chunk.FilePath == filePath {
 			chunks = append(chunks, chunk)
 		}
 	}

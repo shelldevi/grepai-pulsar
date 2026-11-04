@@ -621,6 +621,18 @@ func FindProjectRoot() (string, error) {
 		return "", fmt.Errorf("failed to resolve symlinks: %w", err)
 	}
 
+	// A linked worktree without its own .grepai/ is an unconfigured state:
+	// resolve it explicitly instead of silently attaching to an ancestor
+	// project's tree.
+	if gitInfo, gitErr := git.Detect(cwd); gitErr == nil && gitInfo.IsWorktree && !Exists(gitInfo.GitRoot) {
+		if Exists(gitInfo.MainWorktree) && worktreeDiscoveryAllowed(gitInfo.MainWorktree) {
+			if err := autoInitFromMainWorktree(gitInfo.GitRoot, gitInfo.MainWorktree); err == nil {
+				return gitInfo.GitRoot, nil
+			}
+		}
+		return "", fmt.Errorf("no grepai project found in linked worktree %s (run from the main worktree, copy a .grepai/ config, or enable watch.discover_worktrees in the main project)", gitInfo.GitRoot)
+	}
+
 	dir := cwd
 	for {
 		if Exists(dir) {
@@ -632,20 +644,6 @@ func FindProjectRoot() (string, error) {
 			break
 		}
 		dir = parent
-	}
-
-	// Git worktree fallback: if we're in a linked worktree and the main
-	// worktree has .grepai/, auto-initialize a local copy for isolation.
-	// Each worktree gets its own config + index so search/watch operate
-	// on the worktree's own files. Skipped when the main project sets
-	// watch.discover_worktrees: false.
-	gitInfo, gitErr := git.Detect(cwd)
-	if gitErr == nil && gitInfo.IsWorktree && Exists(gitInfo.MainWorktree) {
-		if worktreeDiscoveryAllowed(gitInfo.MainWorktree) {
-			if err := autoInitFromMainWorktree(gitInfo.GitRoot, gitInfo.MainWorktree); err == nil {
-				return gitInfo.GitRoot, nil
-			}
-		}
 	}
 
 	return "", fmt.Errorf("no grepai project found (run 'grepai init' first)")

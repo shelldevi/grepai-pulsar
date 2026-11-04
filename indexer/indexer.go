@@ -727,6 +727,82 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, filePath string,
 	return cached, len(cached), nil
 }
 
+// ReconcileStoredChunks verifies sidecar/document metadata against the
+// points actually in the store and repairs divergence:
+//
+//   - points present for a file but absent from its document (e.g. a crash
+//     between upserting new points and deleting stale ones) are deleted;
+//   - documents listing chunks that are absent from the store are dropped,
+//     so the next scan re-queues the file (lookups hit the surviving
+//     vectors, keeping the re-index cheap).
+//
+// It runs once at watcher startup, before the initial scan. All access uses
+// only VectorStore interface methods, so it works for every backend.
+func (idx *Indexer) ReconcileStoredChunks(ctx context.Context) (int, error) {
+	paths, err := idx.store.ListDocuments(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list documents for reconcile: %w", err)
+	}
+
+	dropped := 0
+	for _, path := range paths {
+		doc, err := idx.store.GetDocument(ctx, path)
+		if err != nil {
+			log.Printf("Warning: reconcile: cannot read document for %s: %v (keeping entry)", path, err)
+			continue
+		}
+		if doc == nil {
+			continue
+		}
+		chunks, err := idx.store.GetChunksForFile(ctx, path)
+		if err != nil {
+			log.Printf("Warning: reconcile: cannot verify %s: %v (keeping entry)", path, err)
+			continue
+		}
+
+		have := make(map[string]bool, len(chunks))
+		for _, c := range chunks {
+			have[c.ID] = true
+		}
+		want := make(map[string]bool, len(doc.ChunkIDs))
+		for _, id := range doc.ChunkIDs {
+			want[id] = true
+		}
+
+		var stale []string
+		for id := range have {
+			if !want[id] {
+				stale = append(stale, id)
+			}
+		}
+		if len(stale) > 0 {
+			log.Printf("Reconcile: deleting %d orphan chunks for %s left by an interrupted update", len(stale), path)
+			if err := idx.store.DeleteChunksByIDs(ctx, stale); err != nil {
+				log.Printf("Warning: reconcile: failed to delete orphans for %s: %v", path, err)
+			}
+		}
+
+		missing := false
+		for id := range want {
+			if !have[id] {
+				missing = true
+				break
+			}
+		}
+		if missing {
+			log.Printf("Reconcile: dropping document for %s: sidecar lists %d chunks, store has %d; will re-index",
+				path, len(doc.ChunkIDs), len(chunks))
+			if err := idx.store.DeleteDocument(ctx, path); err != nil {
+				log.Printf("Warning: reconcile: failed to drop document for %s: %v", path, err)
+				continue
+			}
+			dropped++
+		}
+	}
+
+	return dropped, nil
+}
+
 // RemoveFile removes a file from the index
 func (idx *Indexer) RemoveFile(ctx context.Context, path string) error {
 	if err := idx.store.DeleteByFile(ctx, path); err != nil {

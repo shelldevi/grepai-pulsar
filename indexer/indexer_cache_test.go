@@ -260,3 +260,57 @@ func TestStaleChunkIDs(t *testing.T) {
 		t.Error("expected no stale IDs without old IDs")
 	}
 }
+
+func TestReconcileStoredChunks(t *testing.T) {
+	ctx := context.Background()
+	newIdx := func() (*Indexer, *cacheMockStore) {
+		st := &cacheMockStore{mockStore: *newMockStore(), lookupVecs: map[string][]float32{}}
+		return &Indexer{root: "/test", store: st, chunker: NewChunker(64, 8)}, st
+	}
+
+	// Orphan points (in store, not in doc) are deleted; doc is kept.
+	idx, st := newIdx()
+	st.documents["a.go"] = store.Document{Path: "a.go", Hash: "h", ChunkIDs: []string{"a.go_0"}}
+	st.chunks["a.go_0"] = store.Chunk{ID: "a.go_0", FilePath: "a.go"}
+	st.chunks["a.go_9"] = store.Chunk{ID: "a.go_9", FilePath: "a.go"}
+	dropped, err := idx.ReconcileStoredChunks(ctx)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if dropped != 0 {
+		t.Errorf("expected no dropped docs, got %d", dropped)
+	}
+	if _, ok := st.chunks["a.go_9"]; ok {
+		t.Error("expected orphan chunk to be deleted")
+	}
+	if _, ok := st.chunks["a.go_0"]; !ok {
+		t.Error("expected live chunk to survive")
+	}
+
+	// Documents listing missing points are dropped for re-indexing.
+	idx, st = newIdx()
+	st.documents["b.go"] = store.Document{Path: "b.go", Hash: "h", ChunkIDs: []string{"b.go_0", "b.go_1"}}
+	st.chunks["b.go_0"] = store.Chunk{ID: "b.go_0", FilePath: "b.go"}
+	dropped, err = idx.ReconcileStoredChunks(ctx)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+	if dropped != 1 {
+		t.Errorf("expected 1 dropped doc, got %d", dropped)
+	}
+	if _, ok := st.documents["b.go"]; ok {
+		t.Error("expected missing-point document to be dropped")
+	}
+
+	// Clean state: no changes.
+	idx, st = newIdx()
+	st.documents["c.go"] = store.Document{Path: "c.go", Hash: "h", ChunkIDs: []string{"c.go_0"}}
+	st.chunks["c.go_0"] = store.Chunk{ID: "c.go_0", FilePath: "c.go"}
+	dropped, err = idx.ReconcileStoredChunks(ctx)
+	if err != nil || dropped != 0 {
+		t.Errorf("expected clean no-op, got dropped=%d err=%v", dropped, err)
+	}
+	if !st.delIDsCalled && len(st.delIDs) != 0 {
+		t.Error("expected no deletions on clean state")
+	}
+}

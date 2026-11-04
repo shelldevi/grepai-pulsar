@@ -46,9 +46,16 @@ func Detect(path string) (*DetectInfo, error) {
 	}
 	gitCommonDir := strings.TrimSpace(string(gitCommonDirOutput))
 
-	// If relative, resolve relative to GitRoot
+	// If relative, resolve relative to the queried path: git prints
+	// --git-common-dir relative to the caller's directory, not to the
+	// toplevel. Resolving against the toplevel misclassifies every nested
+	// subdirectory as a linked worktree.
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get absolute path for %s: %w", path, err)
+	}
 	if !filepath.IsAbs(gitCommonDir) {
-		gitCommonDir = filepath.Join(gitRoot, gitCommonDir)
+		gitCommonDir = filepath.Join(absPath, gitCommonDir)
 	}
 
 	// Make absolute and clean

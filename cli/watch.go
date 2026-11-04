@@ -894,7 +894,10 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 }
 
 // discoverWorktreesForWatch discovers linked worktrees and auto-initializes them.
-// Only discovers from the main worktree; returns nil for linked worktrees.
+// Only the main worktree root discovers: a project nested inside another
+// repo must not adopt that repo's worktrees (their main worktree would be
+// mistaken for a linked one and indexed into the wrong collection).
+// Returns nil for linked worktrees.
 // Discovery (and the auto-init below) is skipped when the main project sets
 // watch.discover_worktrees: false; an unreadable config means enabled.
 func discoverWorktreesForWatch(projectRoot string) []string {
@@ -907,6 +910,12 @@ func discoverWorktreesForWatch(projectRoot string) []string {
 
 	// Only the main worktree discovers linked worktrees
 	if gitInfo.IsWorktree {
+		return nil
+	}
+
+	// Only the repository toplevel discovers: a nested project dir shares
+	// the outer repo's worktree list, whose main entry is not ours.
+	if canonicalPath(gitInfo.GitRoot) != projectRootCanonical {
 		return nil
 	}
 
@@ -1096,9 +1105,11 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
 	// Reconcile sidecar documents against actual points first, so a crash
 	// between upsert and stale-delete (or a reverted file) is re-queued
-	// instead of trusted.
-	if qs, ok := st.(*store.QdrantStore); ok {
-		if n, rerr := qs.ReconcileDocuments(ctx); rerr != nil {
+	// instead of trusted. Skipped for the workspace prefix wrapper: it keeps
+	// chunk IDs and document IDs in different spaces (known inconsistency,
+	// deferred along with the other workspace-mode issues).
+	if _, skip := st.(interface{ SkipReconcile() }); !skip {
+		if n, rerr := idx.ReconcileStoredChunks(ctx); rerr != nil {
 			log.Printf("Warning: reconcile failed for %s: %v", projectRoot, rerr)
 		} else if n > 0 {
 			log.Printf("Reconcile: %d file(s) will be re-indexed for %s", n, projectRoot)
@@ -2869,11 +2880,9 @@ func initializeWorkspaceStore(ctx context.Context, ws *config.Workspace) (store.
 			Dimensions: ws.Embedder.GetDimensions(),
 			Collection: collectionName,
 		})
-		if n, rerr := st.ReconcileDocuments(ctx); rerr != nil {
-			log.Printf("Warning: reconcile failed for workspace %s: %v", ws.Name, rerr)
-		} else if n > 0 {
-			log.Printf("Reconcile: %d file(s) will be re-indexed for workspace %s", n, ws.Name)
-		}
+		// No startup reconciliation here: project runtimes wrap this store
+		// with projectPrefixStore, whose chunk/document ID spaces differ
+		// (deferred workspace-mode issue).
 		return st, nil
 	default:
 		return nil, fmt.Errorf("unsupported backend for workspace: %s", ws.Store.Backend)
@@ -3005,6 +3014,11 @@ func (p *projectPrefixStore) LookupByContentHash(ctx context.Context, contentHas
 	prefixedPath := p.getPrefix() + "/" + p.toRelSlash(filePath)
 	return cache.LookupByContentHash(ctx, contentHash, prefixedPath)
 }
+
+// SkipReconcile marks stores whose chunk IDs and document IDs live in
+// different spaces (project-prefixed points vs unprefixed documents).
+// Indexer.ReconcileStoredChunks compares the two, so it must skip these.
+func (p *projectPrefixStore) SkipReconcile() {}
 
 func (p *projectPrefixStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
 	return p.store.GetAllChunks(ctx)

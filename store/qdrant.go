@@ -135,53 +135,6 @@ func (s *QdrantStore) SetFingerprint(fp CacheFingerprint) {
 	s.cacheDisabled = true
 }
 
-// ReconcileDocuments drops sidecar entries whose stored chunk count does not
-// match the points actually in the collection — e.g. after a crash between
-// upserting new points and deleting stale ones. Dropped files are re-queued
-// by the next scan: lookups hit the surviving vectors and the stale-ID
-// cleanup removes the orphans. Returns the number of dropped documents.
-func (s *QdrantStore) ReconcileDocuments(ctx context.Context) (int, error) {
-	if s.docs == nil {
-		return 0, nil
-	}
-	dropped := 0
-	for _, path := range s.docs.list() {
-		n, err := s.countChunksForFile(ctx, path)
-		if err != nil {
-			log.Printf("Warning: reconcile: cannot verify %s: %v (keeping entry)", path, err)
-			continue
-		}
-		doc, ok := s.docs.get(path)
-		if !ok {
-			continue
-		}
-		if int64(len(doc.ChunkIDs)) != n {
-			log.Printf("Reconcile: dropping document for %s: sidecar lists %d chunks, collection has %d; will re-index",
-				path, len(doc.ChunkIDs), n)
-			s.docs.del(path)
-			dropped++
-		}
-	}
-	return dropped, nil
-}
-
-func (s *QdrantStore) countChunksForFile(ctx context.Context, filePath string) (int64, error) {
-	filter := &qdrant.Filter{
-		Must: []*qdrant.Condition{
-			qdrant.NewMatch("file_path", filePath),
-		},
-	}
-	res, err := s.client.Count(ctx, &qdrant.CountPoints{
-		CollectionName: s.collectionName,
-		Filter:         filter,
-		Exact:          qdrant.PtrOf(true),
-	})
-	if err != nil {
-		return 0, fmt.Errorf("failed to count chunks: %w", err)
-	}
-	return int64(res), nil
-}
-
 func (s *QdrantStore) ensureCollection(ctx context.Context) (bool, error) {
 	exists, err := s.client.CollectionExists(ctx, s.collectionName)
 	if err != nil {
