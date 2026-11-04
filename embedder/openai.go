@@ -117,7 +117,7 @@ func NewOpenAIEmbedder(opts ...OpenAIOption) (*OpenAIEmbedder, error) {
 		parallelism: defaultParallelism,
 		retryPolicy: DefaultRetryPolicy(),
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: pulsarHTTPTimeout(),
 		},
 	}
 
@@ -482,4 +482,19 @@ func (e *OpenAIEmbedder) embedBatchRequest(ctx context.Context, texts []string) 
 	}
 
 	return parseEmbeddingsResponse(body, len(texts))
+}
+
+// pulsarHTTPTimeout returns the HTTP client timeout for embedding requests.
+// Upstream hardcodes 60s which is too tight for large batches against Vertex AI /
+// Bedrock-style backends. Default is 5 minutes; overridable via the
+// GREPAI_HTTP_TIMEOUT env var (Go duration syntax, e.g. "120s", "3m", "10m").
+//
+// Added by grepai-pulsar — https://github.com/shelldevi/grepai-pulsar
+func pulsarHTTPTimeout() time.Duration {
+	if v := os.Getenv("GREPAI_HTTP_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 5 * time.Minute
 }
