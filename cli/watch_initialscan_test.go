@@ -566,3 +566,71 @@ func TestEmitInitialStatsSnapshot_ReportsExistingTotals(t *testing.T) {
 		t.Fatal("expected snapshot delta to be marked as Snapshot")
 	}
 }
+
+func TestHandleFileEvent_BinaryRewriteRemovesIndexAndSymbols(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	srcPath := filepath.Join(projectRoot, "main.go")
+	if err := os.WriteFile(srcPath, []byte("package main\n\nfunc real() {}\n"), 0644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	emb := &countingEmbedder{}
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	chunker := indexer.NewChunker(512, 50)
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	idx := indexer.NewIndexer(projectRoot, vecStore, emb, chunker, scanner, time.Time{})
+
+	// Index the text version first.
+	fileInfo, err := scanner.ScanFile("main.go")
+	if err != nil || fileInfo == nil {
+		t.Fatalf("failed to scan source file: %v %v", fileInfo, err)
+	}
+	if _, err := idx.IndexFile(ctx, *fileInfo); err != nil {
+		t.Fatalf("failed to index source file: %v", err)
+	}
+	before := emb.embedCalls + emb.embedBatchCalls
+	if before == 0 {
+		t.Fatal("expected initial indexing to embed")
+	}
+
+	// Rewrite with binary content: the live event must evict chunks+symbols.
+	if err := os.WriteFile(srcPath, []byte{0x00, 0x01, 0x02, 'x'}, 0644); err != nil {
+		t.Fatalf("failed to write binary file: %v", err)
+	}
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	defer symbolStore.Close()
+
+	cfg := config.DefaultConfig()
+	lastWrite := time.Time{}
+	handleFileEvent(
+		ctx,
+		idx,
+		scanner,
+		trace.NewRegexExtractor(),
+		symbolStore,
+		nil,
+		vecStore,
+		[]string{".go"},
+		projectRoot,
+		cfg,
+		&lastWrite,
+		nil,
+		watcher.FileEvent{Type: watcher.EventModify, Path: "main.go"},
+		nil,
+		nil,
+	)
+
+	if doc, err := vecStore.GetDocument(ctx, "main.go"); err != nil || doc != nil {
+		t.Fatalf("expected document removed after binary rewrite, got %v %v", doc, err)
+	}
+	if chunks, err := vecStore.GetChunksForFile(ctx, "main.go"); err != nil || len(chunks) != 0 {
+		t.Fatalf("expected chunks removed after binary rewrite, got %d %v", len(chunks), err)
+	}
+}

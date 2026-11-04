@@ -231,6 +231,12 @@ type WatchConfig struct {
 	// without this a busy repo (or a very long debounce_ms) starves
 	// indexing indefinitely. Zero (the default) disables the bound.
 	MaxWaitMs                   int       `yaml:"max_wait_ms,omitempty"`
+	// DiscoverWorktrees enables automatic discovery of linked git worktrees:
+	// each discovered worktree gets a local .grepai/ copy and its own
+	// watcher session. Nil (the default) means enabled, matching upstream.
+	// Set to false to disable discovery, auto-init and watchers for new
+	// worktrees everywhere.
+	DiscoverWorktrees           *bool     `yaml:"discover_worktrees,omitempty"`
 	LastIndexTime               time.Time `yaml:"last_index_time,omitempty"`
 	RPGPersistIntervalMs        int       `yaml:"rpg_persist_interval_ms,omitempty"`
 	RPGDerivedDebounceMs        int       `yaml:"rpg_derived_debounce_ms,omitempty"`
@@ -287,6 +293,13 @@ func ValidateIndexerConfig(cfg IndexerConfig) error {
 		return fmt.Errorf("indexer.max_file_size must be >= 0, got %d", cfg.MaxFileSize)
 	}
 	return nil
+}
+
+// WorktreeDiscoveryEnabled reports whether linked-worktree discovery,
+// auto-init and watchers are allowed. Unset means enabled (upstream
+// behavior); explicit false disables all three.
+func (c WatchConfig) WorktreeDiscoveryEnabled() bool {
+	return c.DiscoverWorktrees == nil || *c.DiscoverWorktrees
 }
 
 // ValidateWatchConfig checks watch configuration values for validity.
@@ -624,15 +637,29 @@ func FindProjectRoot() (string, error) {
 	// Git worktree fallback: if we're in a linked worktree and the main
 	// worktree has .grepai/, auto-initialize a local copy for isolation.
 	// Each worktree gets its own config + index so search/watch operate
-	// on the worktree's own files.
+	// on the worktree's own files. Skipped when the main project sets
+	// watch.discover_worktrees: false.
 	gitInfo, gitErr := git.Detect(cwd)
 	if gitErr == nil && gitInfo.IsWorktree && Exists(gitInfo.MainWorktree) {
-		if err := autoInitFromMainWorktree(gitInfo.GitRoot, gitInfo.MainWorktree); err == nil {
-			return gitInfo.GitRoot, nil
+		if worktreeDiscoveryAllowed(gitInfo.MainWorktree) {
+			if err := autoInitFromMainWorktree(gitInfo.GitRoot, gitInfo.MainWorktree); err == nil {
+				return gitInfo.GitRoot, nil
+			}
 		}
 	}
 
 	return "", fmt.Errorf("no grepai project found (run 'grepai init' first)")
+}
+
+// worktreeDiscoveryAllowed reports whether linked-worktree auto-init is
+// allowed by the main worktree's config. Unreadable config means allowed
+// (upstream behavior).
+func worktreeDiscoveryAllowed(mainWorktree string) bool {
+	cfg, err := Load(mainWorktree)
+	if err != nil {
+		return true
+	}
+	return cfg.Watch.WorktreeDiscoveryEnabled()
 }
 
 // AutoInitWorktree creates a local .grepai/ in worktreeRoot by copying config and

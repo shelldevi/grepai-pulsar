@@ -37,6 +37,13 @@ func (m *MockStore) DeleteByFile(ctx context.Context, filePath string) error {
 	return nil
 }
 
+func (m *MockStore) DeleteChunksByIDs(_ context.Context, chunkIDs []string) error {
+	for _, id := range chunkIDs {
+		delete(m.chunks, id)
+	}
+	return nil
+}
+
 func (m *MockStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
 	results := make([]store.SearchResult, 0)
 	for _, chunk := range m.chunks {

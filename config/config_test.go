@@ -712,3 +712,18 @@ func TestIndexerMaxFileSize_YAMLRoundTrip(t *testing.T) {
 		t.Errorf("expected max_file_size to survive round-trip, got %d", loaded.Indexer.MaxFileSize)
 	}
 }
+
+func TestWorktreeDiscoveryEnabled(t *testing.T) {
+	var unset WatchConfig
+	if !unset.WorktreeDiscoveryEnabled() {
+		t.Error("unset must mean enabled (upstream default)")
+	}
+	yes := true
+	if !(WatchConfig{DiscoverWorktrees: &yes}.WorktreeDiscoveryEnabled()) {
+		t.Error("explicit true must mean enabled")
+	}
+	no := false
+	if (WatchConfig{DiscoverWorktrees: &no}.WorktreeDiscoveryEnabled()) {
+		t.Error("explicit false must mean disabled")
+	}
+}

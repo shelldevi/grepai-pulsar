@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -103,5 +105,90 @@ func TestPointVector_FlatAndOneofForms(t *testing.T) {
 	}
 	if pointVector(&qdrant.RetrievedPoint{}) != nil {
 		t.Error("point without vectors must yield nil vector")
+	}
+}
+
+func TestQdrantDocStore_Fingerprint(t *testing.T) {
+	s := newQdrantDocStore(filepath.Join(t.TempDir(), "qdrant_docs.gob"))
+	fp := CacheFingerprint{Model: "m", Dimensions: 64, ChunkSize: 512, ChunkOverlap: 50, Collection: "c"}
+
+	// First adopt (no fingerprint yet) succeeds and marks dirty.
+	if !s.adoptFingerprint(fp) {
+		t.Fatal("expected first adopt to succeed")
+	}
+	// Same fingerprint adopts cleanly.
+	if !s.adoptFingerprint(fp) {
+		t.Fatal("expected same fingerprint to adopt")
+	}
+	// Mismatch refuses.
+	other := fp
+	other.Model = "other"
+	if s.adoptFingerprint(other) {
+		t.Fatal("expected mismatch to refuse adoption")
+	}
+	// Reset clears everything including the fingerprint.
+	s.reset()
+	if len(s.list()) != 0 {
+		t.Fatal("expected reset to clear docs")
+	}
+	if !s.adoptFingerprint(other) {
+		t.Fatal("expected adopt after reset to succeed")
+	}
+
+	// Fingerprint survives a persist/load round-trip.
+	if err := s.persist(); err != nil {
+		t.Fatalf("persist failed: %v", err)
+	}
+	s2 := newQdrantDocStore(s.path)
+	if err := s2.load(); err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	if !s2.adoptFingerprint(other) {
+		t.Fatal("expected loaded fingerprint to match")
+	}
+	if s2.adoptFingerprint(fp) {
+		t.Fatal("expected loaded fingerprint to reject a different one")
+	}
+}
+
+func TestQdrantDocStore_CorruptRebuilds(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qdrant_docs.gob")
+	if err := os.WriteFile(path, []byte("not a gob file{{{}}}"), 0600); err != nil {
+		t.Fatalf("failed to write corrupt file: %v", err)
+	}
+	s := newQdrantDocStore(path)
+	if err := s.load(); err != nil {
+		t.Fatalf("corrupt sidecar must not fail startup: %v", err)
+	}
+	if len(s.list()) != 0 {
+		t.Fatalf("corrupt sidecar must rebuild empty, got %v", s.list())
+	}
+}
+
+func TestQdrantStore_SetFingerprintDisablesCacheOnMismatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qdrant_docs.gob")
+	qs := &QdrantStore{docs: newQdrantDocStore(path)}
+	fp := CacheFingerprint{Model: "m", Dimensions: 64, ChunkSize: 512, ChunkOverlap: 50, Collection: "c"}
+	qs.SetFingerprint(fp)
+	if qs.cacheDisabled {
+		t.Fatal("first fingerprint must not disable the cache")
+	}
+	// Same config: still enabled.
+	qs.SetFingerprint(fp)
+	if qs.cacheDisabled {
+		t.Fatal("same fingerprint must not disable the cache")
+	}
+	// Changed model: discard + disable, loudly (log goes to stderr).
+	changed := fp
+	changed.Model = "m2"
+	qs.SetFingerprint(changed)
+	if !qs.cacheDisabled {
+		t.Fatal("mismatched fingerprint must disable cache lookups")
+	}
+	if n := len(qs.docs.list()); n != 0 {
+		t.Fatalf("mismatch must discard sidecar docs, got %d", n)
+	}
+	if _, found, err := qs.LookupByContentHash(context.Background(), "abc", "f.go"); err != nil || found {
+		t.Fatalf("disabled cache must miss cleanly, got %v %v", found, err)
 	}
 }

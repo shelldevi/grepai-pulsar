@@ -18,7 +18,7 @@ type cacheMockStore struct {
 	lookups    int
 }
 
-func (m *cacheMockStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
+func (m *cacheMockStore) LookupByContentHash(ctx context.Context, contentHash, filePath string) ([]float32, bool, error) {
 	m.lookups++
 	if m.lookupErr != nil {
 		return nil, false, m.lookupErr
@@ -54,10 +54,13 @@ func TestIndexFile_ReusesCachedChunks(t *testing.T) {
 	// Seed the store as if a previous version of the file was indexed.
 	oldContent := "package main\n\nfunc main() {\n\tprintln(\"v1\")\n}\n"
 	oldInfos := NewChunker(64, 8).ChunkWithContext("file.go", oldContent)
+	var oldIDs []string
 	for i, ci := range oldInfos {
 		st.lookupVecs[ci.ContentHash] = cachedVec(float32(i + 1))
 		st.chunks[ci.ID] = store.Chunk{ID: ci.ID, FilePath: "file.go", Content: ci.Content, ContentHash: ci.ContentHash, Vector: cachedVec(1)}
+		oldIDs = append(oldIDs, ci.ID)
 	}
+	st.documents["file.go"] = store.Document{Path: "file.go", Hash: "oldhash", ChunkIDs: oldIDs}
 
 	// One-line change: most chunks keep their content hash.
 	newContent := "package main\n\nfunc main() {\n\tprintln(\"v2\")\n}\n"
@@ -76,12 +79,23 @@ func TestIndexFile_ReusesCachedChunks(t *testing.T) {
 	if got := totalBatchInputs(emb); got > 2 {
 		t.Errorf("expected at most 2 freshly embedded chunks for a one-line edit, got %d", got)
 	}
-	// Old chunks must be gone, new positions stored — no stale leftovers.
-	if !st.delByFileCalled {
-		t.Error("expected DeleteByFile to replace stale positions")
-	}
+	// Old positions must be replaced via upsert-then-delete-stale: every
+	// stored chunk must carry a current ID, with no stale leftovers.
 	if !st.saveChunksCalled {
 		t.Error("expected SaveChunks to store merged vectors")
+	}
+	infos := NewChunker(64, 8).ChunkWithContext("file.go", newContent)
+	wantIDs := make(map[string]bool)
+	for _, ci := range infos {
+		wantIDs[ci.ID] = true
+	}
+	if len(st.chunks) != len(wantIDs) {
+		t.Errorf("expected %d stored chunks with current IDs, got %d", len(wantIDs), len(st.chunks))
+	}
+	for id := range st.chunks {
+		if !wantIDs[id] {
+			t.Errorf("stale chunk left in store: %s", id)
+		}
 	}
 }
 
@@ -176,5 +190,73 @@ func TestIndexFile_EmbedErrorKeepsOldChunks(t *testing.T) {
 	}
 	if st.delByFileCalled {
 		t.Error("DeleteByFile must not run when embedding fails: old chunks stay indexed")
+	}
+}
+
+func TestIndexFile_EmptyFileRemovesStaleState(t *testing.T) {
+	ctx := context.Background()
+	st := &cacheMockStore{mockStore: *newMockStore(), lookupVecs: map[string][]float32{}}
+	emb := newMockBatchEmbedder()
+	idx := newCacheTestIndexer(st, emb)
+
+	// Seed stale state as if a previous non-empty version was indexed.
+	st.chunks["file.go_0"] = store.Chunk{ID: "file.go_0", FilePath: "file.go", Content: "old", Vector: cachedVec(1)}
+	st.documents["file.go"] = store.Document{Path: "file.go", Hash: "oldhash", ChunkIDs: []string{"file.go_0"}}
+
+	n, err := idx.IndexFile(ctx, FileInfo{Path: "file.go", Content: "   \n  \n", Hash: "emptyhash", ModTime: 2})
+	if err != nil {
+		t.Fatalf("IndexFile failed: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 chunks for whitespace file, got %d", n)
+	}
+	if emb.embedCalled || emb.batchCalls > 0 {
+		t.Error("nothing must be embedded for an empty file")
+	}
+	if len(st.chunks) != 0 {
+		t.Errorf("expected stale chunks removed, got %d left", len(st.chunks))
+	}
+	if _, ok := st.documents["file.go"]; ok {
+		t.Error("expected document removed for empty file")
+	}
+}
+
+func TestIndexFilesBatched_EmptyFileRemovesStaleState(t *testing.T) {
+	ctx := context.Background()
+	st := &cacheMockStore{mockStore: *newMockStore(), lookupVecs: map[string][]float32{}}
+	emb := newMockBatchEmbedder()
+	idx := newCacheTestIndexer(st, emb)
+
+	st.chunks["gone.go_0"] = store.Chunk{ID: "gone.go_0", FilePath: "gone.go", Content: "old", Vector: cachedVec(1)}
+	st.documents["gone.go"] = store.Document{Path: "gone.go", Hash: "oldhash", ChunkIDs: []string{"gone.go_0"}}
+
+	n, c, err := idx.indexFilesBatched(ctx, []FileInfo{
+		{Path: "gone.go", Content: "", Hash: "emptyhash", ModTime: 2},
+		{Path: "new.go", Content: "package new\n", Hash: "h2", ModTime: 2},
+	}, emb, nil)
+	if err != nil {
+		t.Fatalf("indexFilesBatched failed: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("expected both files processed, got %d", n)
+	}
+	if _, ok := st.documents["gone.go"]; ok {
+		t.Error("expected document removed for emptied file")
+	}
+	for id := range st.chunks {
+		if len(id) >= 7 && id[:7] == "gone.go" {
+			t.Errorf("stale chunk left: %s", id)
+		}
+	}
+	_ = c
+}
+
+func TestStaleChunkIDs(t *testing.T) {
+	got := staleChunkIDs([]string{"a", "b", "c"}, []string{"b", "d"})
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Errorf("unexpected stale set: %v", got)
+	}
+	if len(staleChunkIDs(nil, []string{"x"})) != 0 {
+		t.Error("expected no stale IDs without old IDs")
 	}
 }

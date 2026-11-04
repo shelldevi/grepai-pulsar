@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,9 +10,12 @@ import (
 	"github.com/yoanbernabeu/grepai/store"
 )
 
+var errTestCache = errors.New("cache down")
+
 type mockVectorStore struct {
 	savedChunks           []store.Chunk
 	deletedByFilePath     string
+	deletedChunkIDs       []string
 	searchVector          []float32
 	searchLimit           int
 	searchPathPrefix      string
@@ -35,6 +39,11 @@ func (m *mockVectorStore) SaveChunks(_ context.Context, chunks []store.Chunk) er
 
 func (m *mockVectorStore) DeleteByFile(_ context.Context, filePath string) error {
 	m.deletedByFilePath = filePath
+	return nil
+}
+
+func (m *mockVectorStore) DeleteChunksByIDs(_ context.Context, chunkIDs []string) error {
+	m.deletedChunkIDs = chunkIDs
 	return nil
 }
 
@@ -281,5 +290,70 @@ func TestProjectPrefixStore_PassThroughAndGetChunks(t *testing.T) {
 	}
 	if mock.getChunksForFilePath != "relative.go" {
 		t.Errorf("GetChunksForFile(rel) path = %q, want %q", mock.getChunksForFilePath, "relative.go")
+	}
+}
+
+type mockCacheVectorStore struct {
+	mockVectorStore
+	lookupHash string
+	lookupPath string
+	lookupVec  []float32
+	lookupErr  error
+	lookups    int
+}
+
+func (m *mockCacheVectorStore) LookupByContentHash(_ context.Context, contentHash, filePath string) ([]float32, bool, error) {
+	m.lookups++
+	m.lookupHash = contentHash
+	m.lookupPath = filePath
+	if m.lookupErr != nil {
+		return nil, false, m.lookupErr
+	}
+	if m.lookupVec == nil {
+		return nil, false, nil
+	}
+	return m.lookupVec, true, nil
+}
+
+func TestProjectPrefixStore_LookupByContentHash(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+	inner := &mockCacheVectorStore{lookupVec: []float32{0.5}}
+	wrapped := &projectPrefixStore{
+		store:         inner,
+		workspaceName: "ws",
+		projectName:   "proj",
+		projectPath:   projectRoot,
+	}
+
+	vec, found, err := wrapped.LookupByContentHash(ctx, "hash1", "pkg/x.go")
+	if err != nil || !found || len(vec) != 1 || vec[0] != 0.5 {
+		t.Fatalf("lookup failed: %v %v %v", vec, found, err)
+	}
+	if want := "ws/proj/pkg/x.go"; inner.lookupPath != want {
+		t.Errorf("underlying lookup path = %q, want %q", inner.lookupPath, want)
+	}
+	if inner.lookupHash != "hash1" {
+		t.Errorf("underlying lookup hash = %q, want %q", inner.lookupHash, "hash1")
+	}
+
+	// Store errors propagate (fail closed in workspace mode too).
+	inner.lookupErr = errTestCache
+	if _, _, err := wrapped.LookupByContentHash(ctx, "hash1", "pkg/x.go"); err == nil {
+		t.Error("expected lookup error to propagate")
+	}
+}
+
+func TestProjectPrefixStore_LookupWithoutUnderlyingCache(t *testing.T) {
+	ctx := context.Background()
+	wrapped := &projectPrefixStore{
+		store:         &mockVectorStore{},
+		workspaceName: "ws",
+		projectName:   "proj",
+		projectPath:   t.TempDir(),
+	}
+	vec, found, err := wrapped.LookupByContentHash(ctx, "hash1", "pkg/x.go")
+	if err != nil || found || vec != nil {
+		t.Errorf("expected clean miss without underlying cache, got %v %v %v", vec, found, err)
 	}
 }

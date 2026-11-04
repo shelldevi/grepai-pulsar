@@ -451,7 +451,18 @@ func initializeStore(ctx context.Context, cfg *config.Config, projectRoot string
 		if collectionName == "" {
 			collectionName = store.SanitizeCollectionName(projectRoot)
 		}
-		return store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions(), qdrantDocPath(projectRoot))
+		st, err := store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions(), qdrantDocPath(projectRoot))
+		if err != nil {
+			return nil, err
+		}
+		st.SetFingerprint(store.CacheFingerprint{
+			Model:        cfg.Embedder.Model,
+			Dimensions:   cfg.Embedder.GetDimensions(),
+			ChunkSize:    cfg.Chunking.Size,
+			ChunkOverlap: cfg.Chunking.Overlap,
+			Collection:   collectionName,
+		})
+		return st, nil
 	default:
 		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Store.Backend)
 	}
@@ -884,6 +895,8 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 
 // discoverWorktreesForWatch discovers linked worktrees and auto-initializes them.
 // Only discovers from the main worktree; returns nil for linked worktrees.
+// Discovery (and the auto-init below) is skipped when the main project sets
+// watch.discover_worktrees: false; an unreadable config means enabled.
 func discoverWorktreesForWatch(projectRoot string) []string {
 	projectRootCanonical := canonicalPath(projectRoot)
 
@@ -894,6 +907,10 @@ func discoverWorktreesForWatch(projectRoot string) []string {
 
 	// Only the main worktree discovers linked worktrees
 	if gitInfo.IsWorktree {
+		return nil
+	}
+
+	if !worktreeDiscoveryEnabled(projectRoot) {
 		return nil
 	}
 
@@ -939,6 +956,17 @@ func discoverWorktreesForWatch(projectRoot string) []string {
 	return worktrees
 }
 
+// worktreeDiscoveryEnabled reports whether linked-worktree discovery is
+// allowed for projectRoot. Unset or unreadable config means enabled,
+// matching upstream behavior.
+func worktreeDiscoveryEnabled(projectRoot string) bool {
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return true
+	}
+	return cfg.Watch.WorktreeDiscoveryEnabled()
+}
+
 func canonicalPath(path string) string {
 	if resolved, err := filepath.EvalSymlinks(path); err == nil {
 		path = resolved
@@ -972,6 +1000,18 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load config for %s: %w", projectRoot, err)
+	}
+
+	// A linked worktree with an explicit (shared) Qdrant collection would
+	// index into the main project's collection under identical relative
+	// paths, deleting and re-embedding each other's points forever.
+	// Refuse before touching the store or embedding anything.
+	if gi, gerr := git.Detect(projectRoot); gerr == nil && gi.IsWorktree &&
+		cfg.Store.Backend == "qdrant" && cfg.Store.Qdrant.Collection != "" {
+		msg := fmt.Sprintf("refusing to watch linked worktree %s: explicit shared Qdrant collection %q would clobber the main project's points; set watch.discover_worktrees: false in the main project config and remove copied .grepai/ dirs from linked worktrees",
+			projectRoot, cfg.Store.Qdrant.Collection)
+		log.Print(msg)
+		return fmt.Errorf("%s", msg)
 	}
 
 	log.Printf("Watching project: %s (backend: %s)", projectRoot, cfg.Store.Backend)
@@ -1054,13 +1094,32 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
 	// Run initial scan and build symbol index.
 	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
+	// Reconcile sidecar documents against actual points first, so a crash
+	// between upsert and stale-delete (or a reverted file) is re-queued
+	// instead of trusted.
+	if qs, ok := st.(*store.QdrantStore); ok {
+		if n, rerr := qs.ReconcileDocuments(ctx); rerr != nil {
+			log.Printf("Warning: reconcile failed for %s: %v", projectRoot, rerr)
+		} else if n > 0 {
+			log.Printf("Reconcile: %d file(s) will be re-indexed for %s", n, projectRoot)
+		}
+	}
+
+	// LastIndexTime is the scan START time: edits made during the scan have
+	// a newer mod time and must not be skipped later as "unchanged".
+	scanStart := time.Now()
 	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, cfg.Watch.LastIndexTime, isBackgroundChild, onScan, onEmbed)
 	if err != nil {
 		return err
 	}
 
+	// Persist the sidecar (new documents) BEFORE recording LastIndexTime,
+	// so a crash in between re-runs the scan instead of skipping it.
+	if perr := st.Persist(ctx); perr != nil {
+		log.Printf("Warning: failed to persist index: %v", perr)
+	}
 	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
-		cfg.Watch.LastIndexTime = time.Now()
+		cfg.Watch.LastIndexTime = scanStart
 		if err := cfg.Save(projectRoot); err != nil {
 			log.Printf("Warning: failed to save config: %v", err)
 		}
@@ -2036,7 +2095,30 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			return
 		}
 		if fileInfo == nil {
-			return // File was skipped (binary, too large, etc.)
+			// Now excluded (too large, binary, minified): drop stale
+			// chunks and symbols, as a full scan does.
+			log.Printf("Removing %s from index: file is now excluded (too large, binary or minified)", event.Path)
+			if err := idx.RemoveFile(ctx, event.Path); err != nil {
+				log.Printf("Failed to remove %s from index: %v", event.Path, err)
+				return
+			}
+			if err := symbolStore.DeleteFile(ctx, event.Path); err != nil {
+				log.Printf("Failed to remove symbols for %s: %v", event.Path, err)
+			}
+			if rpgEncoder != nil {
+				if err := rpgEncoder.HandleFileEvent(ctx, "delete", event.Path, nil); err != nil {
+					log.Printf("Warning: failed to update RPG for removed %s: %v", event.Path, err)
+				}
+			}
+			if onStats != nil {
+				onStats(projectRoot, watchStatsDelta{
+					FilesRemoved:  1,
+					ChunksRemoved: oldChunkCount,
+					SymbolsLost:   oldSymbolCount,
+				})
+			}
+			log.Printf("Removed %s from index", event.Path)
+			return
 		}
 
 		needsReindex, err := idx.NeedsReindex(ctx, fileInfo.Path, fileInfo.Hash)
@@ -2661,16 +2743,27 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		tracedLanguages = []string{".go", ".js", ".ts", ".jsx", ".tsx", ".py", ".php", ".lua", ".java", ".cs", ".fs", ".fsx", ".fsi"}
 	}
 
-	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectCfg.Watch.LastIndexTime, isBackgroundChild, nil, nil)
-	if err != nil {
-		_ = symbolStore.Close()
-		return nil, nil, err
-	}
-	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
-		projectCfg.Watch.LastIndexTime = time.Now()
-		if err := projectCfg.Save(project.Path); err != nil {
-			log.Printf("Warning: failed to save config for %s: %v", project.Name, err)
+	if scanErr := func() error {
+		// LastIndexTime is the scan START time (see single-project path).
+		scanStart := time.Now()
+		stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectCfg.Watch.LastIndexTime, isBackgroundChild, nil, nil)
+		if err != nil {
+			return err
 		}
+		// Persist shared sidecar entries before recording LastIndexTime.
+		if perr := vectorStore.Persist(ctx); perr != nil {
+			log.Printf("Warning: failed to persist index for %s: %v", project.Name, perr)
+		}
+		if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
+			projectCfg.Watch.LastIndexTime = scanStart
+			if err := projectCfg.Save(project.Path); err != nil {
+				log.Printf("Warning: failed to save config for %s: %v", project.Name, err)
+			}
+		}
+		return nil
+	}(); scanErr != nil {
+		_ = symbolStore.Close()
+		return nil, nil, scanErr
 	}
 
 	var rpgStore rpg.RPGStore
@@ -2764,7 +2857,24 @@ func initializeWorkspaceStore(ctx context.Context, ws *config.Workspace) (store.
 		if collectionName == "" {
 			collectionName = "workspace_" + ws.Name
 		}
-		return store.NewQdrantStore(ctx, ws.Store.Qdrant.Endpoint, ws.Store.Qdrant.Port, ws.Store.Qdrant.UseTLS, collectionName, ws.Store.Qdrant.APIKey, ws.Embedder.GetDimensions(), workspaceQdrantDocPath(ws.Name))
+		st, err := store.NewQdrantStore(ctx, ws.Store.Qdrant.Endpoint, ws.Store.Qdrant.Port, ws.Store.Qdrant.UseTLS, collectionName, ws.Store.Qdrant.APIKey, ws.Embedder.GetDimensions(), workspaceQdrantDocPath(ws.Name))
+		if err != nil {
+			return nil, err
+		}
+		// Chunk sizes are per project in workspace mode, so they are not
+		// part of the shared fingerprint; model/dimensions/collection still
+		// guard against vector mixing.
+		st.SetFingerprint(store.CacheFingerprint{
+			Model:      ws.Embedder.Model,
+			Dimensions: ws.Embedder.GetDimensions(),
+			Collection: collectionName,
+		})
+		if n, rerr := st.ReconcileDocuments(ctx); rerr != nil {
+			log.Printf("Warning: reconcile failed for workspace %s: %v", ws.Name, rerr)
+		} else if n > 0 {
+			log.Printf("Reconcile: %d file(s) will be re-indexed for workspace %s", n, ws.Name)
+		}
+		return st, nil
 	default:
 		return nil, fmt.Errorf("unsupported backend for workspace: %s", ws.Store.Backend)
 	}
@@ -2817,6 +2927,21 @@ func (p *projectPrefixStore) DeleteByFile(ctx context.Context, filePath string) 
 	return p.store.DeleteByFile(ctx, prefixedPath)
 }
 
+// DeleteChunksByIDs removes the given chunk IDs after mapping them to the
+// prefixed form used for stored points. This mirrors SaveChunks, which
+// stores "prefix/relPath_index" for an indexer-level "relPath_index".
+func (p *projectPrefixStore) DeleteChunksByIDs(ctx context.Context, chunkIDs []string) error {
+	prefixed := make([]string, 0, len(chunkIDs))
+	for _, id := range chunkIDs {
+		if i := strings.LastIndex(id, "_"); i >= 0 {
+			prefixed = append(prefixed, p.getPrefix()+"/"+p.toRelSlash(id[:i])+id[i:])
+		} else {
+			prefixed = append(prefixed, id)
+		}
+	}
+	return p.store.DeleteChunksByIDs(ctx, prefixed)
+}
+
 func (p *projectPrefixStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
 	return p.store.Search(ctx, queryVector, limit, opts)
 }
@@ -2866,6 +2991,19 @@ func (p *projectPrefixStore) GetChunksForFile(ctx context.Context, filePath stri
 		filePath = p.getPrefix() + "/" + filepath.ToSlash(relPath)
 	}
 	return p.store.GetChunksForFile(ctx, filePath)
+}
+
+// LookupByContentHash implements store.EmbeddingCache through the prefix:
+// lookups use the same prefixed paths as stored chunks, so workspace
+// projects sharing one collection reuse their own vectors and fail closed
+// on store errors like single-project mode.
+func (p *projectPrefixStore) LookupByContentHash(ctx context.Context, contentHash, filePath string) ([]float32, bool, error) {
+	cache, ok := p.store.(store.EmbeddingCache)
+	if !ok {
+		return nil, false, nil
+	}
+	prefixedPath := p.getPrefix() + "/" + p.toRelSlash(filePath)
+	return cache.LookupByContentHash(ctx, contentHash, prefixedPath)
 }
 
 func (p *projectPrefixStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {

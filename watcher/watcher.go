@@ -37,10 +37,14 @@ type Watcher struct {
 	done       chan struct{}
 
 	// Debouncing state
-	pending    map[string]FileEvent
-	pendingMu  sync.Mutex
-	timer      *time.Timer
+	pending     map[string]FileEvent
+	pendingMu   sync.Mutex
+	timer       *time.Timer
 	windowStart time.Time
+	// kick wakes the single dispatcher goroutine. It carries no data:
+	// "something may be pending" — the dispatcher drains everything.
+	// Capacity 1 with coalescing sends: bursts collapse into one wakeup.
+	kick chan struct{}
 }
 
 func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Watcher, error) {
@@ -49,7 +53,7 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Wa
 		return nil, err
 	}
 
-	return &Watcher{
+	w := &Watcher{
 		root:       root,
 		watcher:    fsw,
 		ignore:     ignore,
@@ -57,15 +61,18 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Wa
 		events:     make(chan FileEvent, 100),
 		done:       make(chan struct{}),
 		pending:    make(map[string]FileEvent),
-	}, nil
+		kick:       make(chan struct{}, 1),
+	}
+	go w.dispatch()
+	return w, nil
 }
 
 // SetMaxWaitMs bounds how long a batch may be held while events keep
 // arriving. The debounce timer alone resets on every event, so a
 // continuously active repo (or a very long debounce such as 30 minutes)
-// would starve indexing indefinitely. When set (>0), the first event that
-// arrives at least maxWaitMs after the oldest pending event flushes the
-// batch immediately. Zero (the default) keeps the previous behavior.
+// would starve indexing indefinitely. When set (>0), the batch flushes no
+// later than maxWaitMs after the oldest pending event. Zero (the default)
+// keeps the previous behavior.
 func (w *Watcher) SetMaxWaitMs(maxWaitMs int) {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
@@ -90,6 +97,15 @@ func (w *Watcher) Events() <-chan FileEvent {
 
 func (w *Watcher) Close() error {
 	close(w.done)
+	w.pendingMu.Lock()
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	w.pendingMu.Unlock()
+	if w.watcher == nil {
+		return nil
+	}
 	return w.watcher.Close()
 }
 
@@ -204,8 +220,9 @@ func (w *Watcher) debounceEvent(event FileEvent) {
 	w.pendingMu.Lock()
 
 	// A new window starts when nothing is pending.
+	now := time.Now()
 	if len(w.pending) == 0 {
-		w.windowStart = time.Now()
+		w.windowStart = now
 	}
 
 	// Merge events: delete > create/modify
@@ -217,44 +234,70 @@ func (w *Watcher) debounceEvent(event FileEvent) {
 		w.pending[event.Path] = event
 	}
 
-	// Max-wait bound: flush now if the oldest pending event has waited
-	// long enough, no matter how active the repo is. This is checked on
-	// event arrival, so the overshoot is at most the inter-arrival gap.
-	flushNow := w.maxWaitMs > 0 && !w.windowStart.IsZero() &&
-		time.Since(w.windowStart) >= time.Duration(w.maxWaitMs)*time.Millisecond
+	// Arm a single timer at min(debounce from now, remaining max wait from
+	// the window start). This is what really bounds the wait: the timer
+	// fires at the bound even if no further events arrive, and continuous
+	// events keep re-arming it at the max-wait deadline.
+	delay := time.Duration(w.debounceMs) * time.Millisecond
+	if w.maxWaitMs > 0 && !w.windowStart.IsZero() {
+		if remaining := w.windowStart.Add(time.Duration(w.maxWaitMs) * time.Millisecond).Sub(now); remaining < delay {
+			delay = remaining
+		}
+	}
 
 	// Reset timer
 	if w.timer != nil {
 		w.timer.Stop()
 	}
-	if !flushNow {
-		w.timer = time.AfterFunc(time.Duration(w.debounceMs)*time.Millisecond, w.flush)
+	if delay <= 0 {
+		w.pendingMu.Unlock()
+		w.requestFlush()
+		return
 	}
+	w.timer = time.AfterFunc(delay, w.requestFlush)
 	w.pendingMu.Unlock()
+}
 
-	if flushNow {
-		w.flush()
+// requestFlush wakes the dispatcher (coalescing: at most one pending kick).
+func (w *Watcher) requestFlush() {
+	select {
+	case w.kick <- struct{}{}:
+	default:
 	}
 }
 
-func (w *Watcher) flush() {
+// dispatch is the single serial flush loop. All deliveries to the events
+// channel happen here, so flushes never interleave and processEvents (which
+// only feeds the pending map) is never blocked by a slow consumer.
+func (w *Watcher) dispatch() {
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-w.kick:
+			w.flushPending()
+		}
+	}
+}
+
+func (w *Watcher) flushPending() {
 	w.pendingMu.Lock()
+	if len(w.pending) == 0 {
+		w.pendingMu.Unlock()
+		return
+	}
 	events := make([]FileEvent, 0, len(w.pending))
 	for _, event := range w.pending {
 		events = append(events, event)
 	}
 	w.pending = make(map[string]FileEvent)
 	w.windowStart = time.Time{}
-	if w.timer != nil {
-		w.timer.Stop()
-		w.timer = nil
-	}
 	w.pendingMu.Unlock()
 
 	// Blocking send: a burst larger than the channel buffer applies
 	// backpressure instead of dropping files. Dropping here would leave
 	// files unindexed until the next restart, which with a long debounce
-	// could be far away.
+	// could be far away. Exits promptly on shutdown.
 	for _, event := range events {
 		select {
 		case w.events <- event:

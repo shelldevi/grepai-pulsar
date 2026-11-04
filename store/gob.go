@@ -59,7 +59,17 @@ func (s *GOBStore) DeleteByFile(ctx context.Context, filePath string) error {
 	for _, chunkID := range doc.ChunkIDs {
 		delete(s.chunks, chunkID)
 	}
+	return nil
+}
 
+// DeleteChunksByIDs removes the chunks with the given IDs.
+func (s *GOBStore) DeleteChunksByIDs(ctx context.Context, chunkIDs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, chunkID := range chunkIDs {
+		delete(s.chunks, chunkID)
+	}
 	return nil
 }
 
@@ -313,13 +323,14 @@ func (s *GOBStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 	return chunks, nil
 }
 
-// LookupByContentHash searches in-memory chunks for a matching content hash.
-func (s *GOBStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
+// LookupByContentHash searches in-memory chunks for a matching content hash
+// stored under the given file path.
+func (s *GOBStore) LookupByContentHash(ctx context.Context, contentHash, filePath string) ([]float32, bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	for _, chunk := range s.chunks {
-		if chunk.ContentHash == contentHash && len(chunk.Vector) > 0 {
+		if chunk.ContentHash == contentHash && chunk.FilePath == filePath && len(chunk.Vector) > 0 {
 			vec := make([]float32, len(chunk.Vector))
 			copy(vec, chunk.Vector)
 			return vec, true, nil

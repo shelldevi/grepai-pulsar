@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -31,6 +32,10 @@ type QdrantStore struct {
 	// unless the store was constructed with a document path — read-only
 	// consumers (search, status, MCP) leave it unset.
 	docs *qdrantDocStore
+	// cacheDisabled forces cache lookups to miss for the lifetime of this
+	// store. Set when the embedding fingerprint mismatches, so a config
+	// change never mixes vectors from another model or chunking.
+	cacheDisabled bool
 }
 
 func parseHost(endpoint string) string {
@@ -72,7 +77,8 @@ func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool,
 		apiKey:         apiKey,
 	}
 
-	if err := store.ensureCollection(ctx); err != nil {
+	created, err := store.ensureCollection(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -85,20 +91,107 @@ func NewQdrantStore(ctx context.Context, endpoint string, port int, useTLS bool,
 			return nil, err
 		}
 		store.docs = docs
+
+		// A new or emptied collection with a non-empty sidecar means the
+		// collection was wiped, renamed or recreated: the sidecar describes
+		// points that no longer exist. Discard it loudly; the next scan
+		// backfills everything.
+		if created || store.collectionPoints(ctx) == 0 {
+			if n := len(docs.list()); n > 0 {
+				log.Printf("Warning: Qdrant collection %s is new or empty but the document sidecar lists %d files; discarding sidecar and re-indexing from scratch", collection, n)
+				docs.reset()
+			}
+		}
 	}
 
 	return store, nil
 }
 
-func (s *QdrantStore) ensureCollection(ctx context.Context) error {
+// collectionPoints returns the collection's point count, or -1 when it
+// cannot be determined (treated as unknown, never as empty).
+func (s *QdrantStore) collectionPoints(ctx context.Context) int64 {
+	info, err := s.client.GetCollectionInfo(ctx, s.collectionName)
+	if err != nil || info == nil || info.PointsCount == nil {
+		return -1
+	}
+	return int64(*info.PointsCount)
+}
+
+// SetFingerprint records the embedding configuration for this run and
+// compares it with the sidecar's. A mismatch discards the sidecar and
+// disables cache lookups for the run, loudly, so a model/dimension/
+// chunking/collection change never mixes vectors.
+func (s *QdrantStore) SetFingerprint(fp CacheFingerprint) {
+	if s.docs == nil {
+		return
+	}
+	if s.docs.adoptFingerprint(fp) {
+		return
+	}
+	old := s.docs.fingerprint()
+	log.Printf("WARNING: embedding configuration changed (was %+v, now %+v): discarding Qdrant document sidecar and disabling embedding-cache reuse for this run", old, fp)
+	s.docs.reset()
+	s.docs.adoptFingerprint(fp)
+	s.cacheDisabled = true
+}
+
+// ReconcileDocuments drops sidecar entries whose stored chunk count does not
+// match the points actually in the collection — e.g. after a crash between
+// upserting new points and deleting stale ones. Dropped files are re-queued
+// by the next scan: lookups hit the surviving vectors and the stale-ID
+// cleanup removes the orphans. Returns the number of dropped documents.
+func (s *QdrantStore) ReconcileDocuments(ctx context.Context) (int, error) {
+	if s.docs == nil {
+		return 0, nil
+	}
+	dropped := 0
+	for _, path := range s.docs.list() {
+		n, err := s.countChunksForFile(ctx, path)
+		if err != nil {
+			log.Printf("Warning: reconcile: cannot verify %s: %v (keeping entry)", path, err)
+			continue
+		}
+		doc, ok := s.docs.get(path)
+		if !ok {
+			continue
+		}
+		if int64(len(doc.ChunkIDs)) != n {
+			log.Printf("Reconcile: dropping document for %s: sidecar lists %d chunks, collection has %d; will re-index",
+				path, len(doc.ChunkIDs), n)
+			s.docs.del(path)
+			dropped++
+		}
+	}
+	return dropped, nil
+}
+
+func (s *QdrantStore) countChunksForFile(ctx context.Context, filePath string) (int64, error) {
+	filter := &qdrant.Filter{
+		Must: []*qdrant.Condition{
+			qdrant.NewMatch("file_path", filePath),
+		},
+	}
+	res, err := s.client.Count(ctx, &qdrant.CountPoints{
+		CollectionName: s.collectionName,
+		Filter:         filter,
+		Exact:          qdrant.PtrOf(true),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to count chunks: %w", err)
+	}
+	return int64(res), nil
+}
+
+func (s *QdrantStore) ensureCollection(ctx context.Context) (bool, error) {
 	exists, err := s.client.CollectionExists(ctx, s.collectionName)
 	if err != nil {
-		return fmt.Errorf("failed to check collection existence: %w", err)
+		return false, fmt.Errorf("failed to check collection existence: %w", err)
 	}
 
+	created := false
 	if !exists {
 		if s.dimensions <= 0 {
-			return fmt.Errorf("dimensions must be positive, got: %d", s.dimensions)
+			return false, fmt.Errorf("dimensions must be positive, got: %d", s.dimensions)
 		}
 		err = s.client.CreateCollection(ctx, &qdrant.CreateCollection{
 			CollectionName: s.collectionName,
@@ -108,8 +201,9 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) error {
 			}),
 		})
 		if err != nil {
-			return fmt.Errorf("failed to create collection: %w", err)
+			return false, fmt.Errorf("failed to create collection: %w", err)
 		}
+		created = true
 	}
 
 	// Create field index for content_hash to enable efficient lookups.
@@ -120,7 +214,7 @@ func (s *QdrantStore) ensureCollection(ctx context.Context) error {
 		FieldType:      qdrant.PtrOf(qdrant.FieldType_FieldTypeKeyword),
 	})
 
-	return nil
+	return created, nil
 }
 
 func sanitizeCollectionName(path string) string {
@@ -251,6 +345,30 @@ func (s *QdrantStore) DeleteByFile(ctx context.Context, filePath string) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete points: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteChunksByIDs removes the points with the given chunk IDs, leaving all
+// other points untouched. Chunk IDs map to point IDs deterministically
+// (UUIDv5 of the chunk ID), so callers pass store.Chunk IDs directly.
+func (s *QdrantStore) DeleteChunksByIDs(ctx context.Context, chunkIDs []string) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+
+	ids := make([]*qdrant.PointId, 0, len(chunkIDs))
+	for _, chunkID := range chunkIDs {
+		ids = append(ids, qdrant.NewID(s.getUUIDForChunk(chunkID).String()))
+	}
+
+	_, err := s.client.Delete(ctx, &qdrant.DeletePoints{
+		CollectionName: s.collectionName,
+		Points:         qdrant.NewPointsSelectorIDs(ids),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete points by IDs: %w", err)
 	}
 
 	return nil
@@ -549,15 +667,23 @@ func (s *QdrantStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 	return chunks, nil
 }
 
-// LookupByContentHash searches Qdrant for a point matching the content hash.
-func (s *QdrantStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
+// LookupByContentHash searches Qdrant for a point matching the content hash
+// stored under the given file path. Both predicates are required: a vector
+// encodes its file's identity, so cross-path reuse would attach the wrong
+// file context to the new chunks.
+func (s *QdrantStore) LookupByContentHash(ctx context.Context, contentHash, filePath string) ([]float32, bool, error) {
 	if contentHash == "" {
+		return nil, false, nil
+	}
+	if s.cacheDisabled {
+		// Embedding configuration changed for this run: never reuse.
 		return nil, false, nil
 	}
 
 	filter := &qdrant.Filter{
 		Must: []*qdrant.Condition{
 			qdrant.NewMatch("content_hash", contentHash),
+			qdrant.NewMatch("file_path", filePath),
 		},
 	}
 

@@ -60,6 +60,11 @@ type VectorStore interface {
 	// DeleteByFile removes all chunks for a given file path
 	DeleteByFile(ctx context.Context, filePath string) error
 
+	// DeleteChunksByIDs removes the chunks with the given IDs, leaving all
+	// other points untouched. Used to delete only the stale positions of a
+	// re-indexed file after the new points are upserted.
+	DeleteChunksByIDs(ctx context.Context, chunkIDs []string) error
+
 	// Search finds the most similar chunks to a query vector
 	Search(ctx context.Context, queryVector []float32, limit int, opts SearchOptions) ([]SearchResult, error)
 
@@ -102,8 +107,13 @@ type VectorStore interface {
 // implements this interface, the indexer will look up existing embeddings by
 // content hash before calling the embedder, avoiding redundant API calls for
 // identical content (e.g., across git worktrees).
+//
+// Reuse is scoped to the same file path as well as the hash: a stored
+// vector encodes its file's identity ("File: <path>" header), so a renamed
+// file correctly re-embeds instead of inheriting another path's vector.
 type EmbeddingCache interface {
-	// LookupByContentHash returns the embedding vector for the given content hash.
+	// LookupByContentHash returns the embedding vector for the given content
+	// hash stored under the given file path.
 	// Returns (vector, true, nil) if found, (nil, false, nil) if not found.
-	LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error)
+	LookupByContentHash(ctx context.Context, contentHash, filePath string) ([]float32, bool, error)
 }

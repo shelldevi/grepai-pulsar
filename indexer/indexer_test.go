@@ -24,6 +24,8 @@ type mockStore struct {
 	saveDocCalled    bool
 	saveChunksCalled bool
 	delByFileCalled  bool
+	delIDsCalled     bool
+	delIDs           []string
 	delDocCalled     bool
 }
 
@@ -38,6 +40,15 @@ func (m *mockStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error 
 	m.saveChunksCalled = true
 	for _, chunk := range chunks {
 		m.chunks[chunk.ID] = chunk
+	}
+	return nil
+}
+
+func (m *mockStore) DeleteChunksByIDs(ctx context.Context, chunkIDs []string) error {
+	m.delIDsCalled = true
+	m.delIDs = append(m.delIDs, chunkIDs...)
+	for _, id := range chunkIDs {
+		delete(m.chunks, id)
 	}
 	return nil
 }

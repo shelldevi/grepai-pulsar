@@ -144,7 +144,14 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			continue
 		}
 		if file == nil {
-			stats.FilesSkipped++
+			// Excluded since last index (too large, binary, minified):
+			// drop stale chunks and documents instead of keeping them.
+			log.Printf("Removing %s from index: file is now excluded (too large, binary or minified)", fileMeta.Path)
+			if rerr := idx.RemoveFile(ctx, fileMeta.Path); rerr != nil {
+				log.Printf("Failed to remove %s: %v", fileMeta.Path, rerr)
+			} else {
+				stats.FilesRemoved++
+			}
 			delete(existingMap, fileMeta.Path)
 			continue
 		}
@@ -266,9 +273,27 @@ func createStoreChunks(chunkInfos []ChunkInfo, embeddings [][]float32, now time.
 }
 
 // saveFileData saves chunks and document metadata for a single file.
+// New points are upserted BEFORE stale ones are deleted (point IDs are
+// deterministic from chunk IDs), so a crash between the steps leaves
+// duplicates that the next run's reconciliation and cleanup remove —
+// never an absent file with a sidecar claiming it is indexed.
 func (idx *Indexer) saveFileData(ctx context.Context, fd fileChunkData, chunks []store.Chunk, chunkIDs []string) error {
+	var oldIDs []string
+	if doc, err := idx.store.GetDocument(ctx, fd.file.Path); err != nil {
+		return fmt.Errorf("failed to read document for %s: %w", fd.file.Path, err)
+	} else if doc != nil {
+		oldIDs = doc.ChunkIDs
+	}
+
 	if err := idx.store.SaveChunks(ctx, chunks); err != nil {
 		return fmt.Errorf("failed to save chunks for %s: %w", fd.file.Path, err)
+	}
+
+	stale := staleChunkIDs(oldIDs, chunkIDs)
+	if len(stale) > 0 {
+		if err := idx.store.DeleteChunksByIDs(ctx, stale); err != nil {
+			return fmt.Errorf("failed to delete %d stale chunks for %s: %w", len(stale), fd.file.Path, err)
+		}
 	}
 
 	doc := store.Document{
@@ -283,6 +308,29 @@ func (idx *Indexer) saveFileData(ctx context.Context, fd fileChunkData, chunks [
 	}
 
 	return nil
+}
+
+// staleChunkIDs returns old chunk IDs that are not part of the new set.
+func staleChunkIDs(oldIDs, newIDs []string) []string {
+	keep := make(map[string]bool, len(newIDs))
+	for _, id := range newIDs {
+		keep[id] = true
+	}
+	var stale []string
+	for _, id := range oldIDs {
+		if !keep[id] {
+			stale = append(stale, id)
+		}
+	}
+	return stale
+}
+
+// persistStore best-effort persists the store so completed files survive a
+// crash. Used on error paths; the periodic/shutdown persists cover the rest.
+func (idx *Indexer) persistStore(ctx context.Context) {
+	if err := idx.store.Persist(ctx); err != nil {
+		log.Printf("Warning: failed to persist index after error: %v", err)
+	}
 }
 
 // wrapBatchProgress creates an embedder.BatchProgress callback from BatchProgressCallback.
@@ -349,7 +397,7 @@ func (idx *Indexer) indexFilesBatched(
 					uncached = append(uncached, uncachedRef{fdIndex: i, chunkIdx: j})
 					continue
 				}
-				vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
+				vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash, fd.file.Path)
 				if err != nil {
 					return filesIndexed, chunksCreated, fmt.Errorf(
 						"embedding cache lookup failed for %s (chunk %d): %w — aborting batch before any paid embedding",
@@ -400,6 +448,7 @@ func (idx *Indexer) indexFilesBatched(
 		batches := embedder.FormBatches(remaining)
 		results, err := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress))
 		if err != nil {
+			idx.persistStore(ctx)
 			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", err)
 		}
 
@@ -407,6 +456,7 @@ func (idx *Indexer) indexFilesBatched(
 		for fdIdx, us := range remainingPos {
 			for pos, u := range us {
 				if pos >= len(fileEmbeddings[fdIdx]) || fileEmbeddings[fdIdx][pos] == nil {
+					idx.persistStore(ctx)
 					return filesIndexed, chunksCreated, fmt.Errorf(
 						"missing embedding for %s (chunk %d): aborting batch to avoid storing a partial file",
 						fileData[fdIdx].file.Path, uncached[u].chunkIdx)
@@ -427,9 +477,6 @@ func (idx *Indexer) indexFilesBatched(
 		freshByFile[ref.fdIndex][ref.chunkIdx] = freshVecs[u]
 	}
 	for i, fd := range fileData {
-		if err := idx.store.DeleteByFile(ctx, fd.file.Path); err != nil {
-			return filesIndexed, chunksCreated, fmt.Errorf("failed to delete existing chunks for %s: %w", fd.file.Path, err)
-		}
 		vectors := make([][]float32, len(fd.chunkInfos))
 		for j := range fd.chunkInfos {
 			if v, ok := cachedVecs[i][j]; ok {
@@ -440,10 +487,29 @@ func (idx *Indexer) indexFilesBatched(
 		}
 		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, vectors, now)
 		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+			idx.persistStore(ctx)
 			return filesIndexed, chunksCreated, err
 		}
 		filesIndexed++
 		chunksCreated += len(chunks)
+	}
+
+	// Files that chunk to nothing (truncated to empty or whitespace-only)
+	// must not keep stale chunks or documents.
+	chunked := make(map[int]bool, len(fileData))
+	for _, fd := range fileData {
+		chunked[fd.fileIndex] = true
+	}
+	for i, file := range files {
+		if chunked[i] {
+			continue
+		}
+		log.Printf("Removing %s from index: file is now empty", file.Path)
+		if err := idx.RemoveFile(ctx, file.Path); err != nil {
+			idx.persistStore(ctx)
+			return filesIndexed, chunksCreated, err
+		}
+		filesIndexed++
 	}
 
 	return filesIndexed, chunksCreated, nil
@@ -466,12 +532,20 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 	// Chunk the file
 	chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
 	if len(chunkInfos) == 0 {
+		// Truncated to empty or whitespace-only: drop stale state instead
+		// of leaving the old chunks behind.
+		log.Printf("Removing %s from index: file is now empty", file.Path)
+		if err := idx.RemoveFile(ctx, file.Path); err != nil {
+			idx.persistStore(ctx)
+			return 0, err
+		}
 		return 0, nil
 	}
 
 	// Check embedding cache for content-addressed deduplication
 	cachedVectors, cacheHits, err := idx.lookupCachedEmbeddings(ctx, file.Path, chunkInfos)
 	if err != nil {
+		idx.persistStore(ctx)
 		return 0, err
 	}
 	if cacheHits > 0 {
@@ -542,46 +616,15 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 		}
 	}
 
-	// Create store chunks
+	// Replace the file's chunks only after embedding succeeded, via
+	// upsert-then-delete-stale so a crash cannot leave the file absent
+	// while the document claims it is indexed.
 	now := time.Now()
-	chunks := make([]store.Chunk, len(finalChunks))
-	chunkIDs := make([]string, len(finalChunks))
-
-	for i, info := range finalChunks {
-		chunks[i] = store.Chunk{
-			ID:          info.ID,
-			FilePath:    info.FilePath,
-			StartLine:   info.StartLine,
-			EndLine:     info.EndLine,
-			Content:     info.Content,
-			Vector:      vectors[i],
-			Hash:        info.Hash,
-			ContentHash: info.ContentHash,
-			UpdatedAt:   now,
-		}
-		chunkIDs[i] = info.ID
-	}
-
-	// Replace the file's chunks only after embedding succeeded.
-	if err := idx.store.DeleteByFile(ctx, file.Path); err != nil {
-		return 0, fmt.Errorf("failed to delete existing chunks for %s: %w", file.Path, err)
-	}
-
-	// Save chunks
-	if err := idx.store.SaveChunks(ctx, chunks); err != nil {
-		return 0, fmt.Errorf("failed to save chunks: %w", err)
-	}
-
-	// Save document metadata
-	doc := store.Document{
-		Path:     file.Path,
-		Hash:     file.Hash,
-		ModTime:  time.Unix(file.ModTime, 0),
-		ChunkIDs: chunkIDs,
-	}
-
-	if err := idx.store.SaveDocument(ctx, doc); err != nil {
-		return 0, fmt.Errorf("failed to save document: %w", err)
+	chunks, chunkIDs := createStoreChunks(finalChunks, vectors, now)
+	fd := fileChunkData{file: file, chunkInfos: finalChunks}
+	if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
+		idx.persistStore(ctx)
+		return 0, err
 	}
 
 	return len(chunks), nil
@@ -672,7 +715,7 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, filePath string,
 		if chunk.ContentHash == "" {
 			continue
 		}
-		vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash)
+		vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash, filePath)
 		if err != nil {
 			return nil, 0, fmt.Errorf("embedding cache lookup failed for %s (chunk %d): %w — aborting before any paid embedding", filePath, i, err)
 		}

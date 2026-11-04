@@ -138,6 +138,21 @@ func (s *PostgresStore) DeleteByFile(ctx context.Context, filePath string) error
 	return nil
 }
 
+// DeleteChunksByIDs removes the chunks with the given IDs.
+func (s *PostgresStore) DeleteChunksByIDs(ctx context.Context, chunkIDs []string) error {
+	if len(chunkIDs) == 0 {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx,
+		`DELETE FROM chunks WHERE project_id = $1 AND id = ANY($2)`,
+		s.projectID, chunkIDs,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to delete chunks by IDs: %w", err)
+	}
+	return nil
+}
+
 func (s *PostgresStore) Search(ctx context.Context, queryVector []float32, limit int, opts SearchOptions) ([]SearchResult, error) {
 	vec := pgvector.NewVector(queryVector)
 
@@ -373,16 +388,17 @@ func (s *PostgresStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 	return chunks, rows.Err()
 }
 
-// LookupByContentHash queries the chunks table for a matching content hash and returns the vector.
-func (s *PostgresStore) LookupByContentHash(ctx context.Context, contentHash string) ([]float32, bool, error) {
+// LookupByContentHash queries the chunks table for a matching content hash
+// stored under the given file path and returns the vector.
+func (s *PostgresStore) LookupByContentHash(ctx context.Context, contentHash, filePath string) ([]float32, bool, error) {
 	if contentHash == "" {
 		return nil, false, nil
 	}
 
 	var vec pgvector.Vector
 	err := s.pool.QueryRow(ctx,
-		`SELECT vector FROM chunks WHERE content_hash = $1 AND vector IS NOT NULL LIMIT 1`,
-		contentHash,
+		`SELECT vector FROM chunks WHERE content_hash = $1 AND file_path = $2 AND vector IS NOT NULL LIMIT 1`,
+		contentHash, filePath,
 	).Scan(&vec)
 
 	if err == pgx.ErrNoRows {

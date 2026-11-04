@@ -387,7 +387,7 @@ func TestGOBStore_LookupByContentHash(t *testing.T) {
 	})
 
 	// Lookup existing hash
-	vec, found, err := store.LookupByContentHash(ctx, "abc123")
+	vec, found, err := store.LookupByContentHash(ctx, "abc123", "main.go")
 	if err != nil {
 		t.Fatalf("LookupByContentHash failed: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestGOBStore_LookupByContentHash(t *testing.T) {
 	}
 
 	// Lookup non-existent hash
-	_, found, err = store.LookupByContentHash(ctx, "nonexistent")
+	_, found, err = store.LookupByContentHash(ctx, "nonexistent", "main.go")
 	if err != nil {
 		t.Fatalf("LookupByContentHash failed: %v", err)
 	}
@@ -442,5 +442,27 @@ func TestGOBStore_FileLocking(t *testing.T) {
 	}
 	if chunks[0].ID != "c1" {
 		t.Errorf("Expected chunk ID c1, got %s", chunks[0].ID)
+	}
+}
+
+func TestGOBStore_LookupByContentHash_PathScoped(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	s := NewGOBStore(indexPath)
+	ctx := context.Background()
+
+	if err := s.SaveChunks(ctx, []Chunk{{
+		ID: "a.go_0", FilePath: "a.go", Content: "same text",
+		Vector: []float32{0.1}, ContentHash: "dup",
+	}}); err != nil {
+		t.Fatalf("SaveChunks failed: %v", err)
+	}
+
+	// Same hash, same path: hit.
+	if _, found, err := s.LookupByContentHash(ctx, "dup", "a.go"); err != nil || !found {
+		t.Errorf("expected hit for same path, got found=%v err=%v", found, err)
+	}
+	// Same hash, different path (e.g. renamed file): miss, re-embeds.
+	if _, found, err := s.LookupByContentHash(ctx, "dup", "b.go"); err != nil || found {
+		t.Errorf("expected miss for different path, got found=%v err=%v", found, err)
 	}
 }
