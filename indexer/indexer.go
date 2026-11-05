@@ -18,6 +18,19 @@ type Indexer struct {
 	chunker       *Chunker
 	scanner       *Scanner
 	lastIndexTime time.Time
+	// pendingSweep is a clean collection snapshot taken by
+	// ReconcileStoredChunks, consumed once by SweepUnexpectedPoints after a
+	// scan that completed without error. Nil means no sweep is armed (no
+	// reconcile ran, the store has no bulk support, or the scroll failed).
+	pendingSweep *reconcileSweep
+}
+
+// reconcileSweep is the deferred half of startup reconcile: point IDs that
+// belonged to no document when the collection was scrolled, plus the
+// collection size that guards the sweep.
+type reconcileSweep struct {
+	unexpected []string
+	total      int
 }
 
 type IndexStats struct {
@@ -518,6 +531,61 @@ func (idx *Indexer) indexFilesBatched(
 		return 0, 0, nil
 	}
 
+	// Commit progress in bounded groups: embed one group, save it, persist,
+	// next group. One failed batch or save no longer discards the other paid
+	// groups; an interrupted scan resumes paying only for files not yet
+	// saved. Rate-limit and batching behaviour inside a group is unchanged.
+	for start := 0; start < len(fileData); start += indexCommitGroupFiles {
+		end := start + indexCommitGroupFiles
+		if end > len(fileData) {
+			end = len(fileData)
+		}
+		fi, ch, gerr := idx.indexFileGroup(ctx, fileData[start:end], batchEmb, onProgress)
+		filesIndexed += fi
+		chunksCreated += ch
+		// Persist completed groups so they survive a crash or a later
+		// group failing. Sidecar persists are dirty-gated, so this is
+		// cheap when nothing changed.
+		idx.persistStore(ctx)
+		if gerr != nil {
+			return filesIndexed, chunksCreated, gerr
+		}
+	}
+
+	// Files that chunk to nothing (truncated to empty or whitespace-only)
+	// must not keep stale chunks or documents.
+	chunked := make(map[int]bool, len(fileData))
+	for _, fd := range fileData {
+		chunked[fd.fileIndex] = true
+	}
+	for i, file := range files {
+		if chunked[i] {
+			continue
+		}
+		log.Printf("Removing %s from index: file is now empty", file.Path)
+		if err := idx.RemoveFile(ctx, file.Path); err != nil {
+			idx.persistStore(ctx)
+			return filesIndexed, chunksCreated, err
+		}
+		filesIndexed++
+	}
+
+	return filesIndexed, chunksCreated, nil
+}
+
+// indexFileGroup embeds and saves one commit group of already-chunked files:
+// look up every chunk, embed the misses, then replace each file's chunks.
+// Deletes happen only after all embedding for the group succeeded: an embed
+// failure leaves the previous index intact instead of an empty file. A cache
+// lookup failure aborts before any embedding call — it usually means the
+// store is unreachable, and embedding anyway would pay for vectors that then
+// fail to save.
+func (idx *Indexer) indexFileGroup(
+	ctx context.Context,
+	fileData []fileChunkData,
+	batchEmb embedder.BatchEmbedder,
+	onProgress BatchProgressCallback,
+) (filesIndexed int, chunksCreated int, err error) {
 	// Look up every chunk before touching the store: deletes happen only
 	// after all lookups succeed, so lookups can still hit the vectors that
 	// are about to be replaced.
@@ -588,7 +656,6 @@ func (idx *Indexer) indexFilesBatched(
 		batches := embedder.FormBatches(remaining)
 		results, err := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress))
 		if err != nil {
-			idx.persistStore(ctx)
 			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", err)
 		}
 
@@ -596,7 +663,6 @@ func (idx *Indexer) indexFilesBatched(
 		for fdIdx, us := range remainingPos {
 			for pos, u := range us {
 				if pos >= len(fileEmbeddings[fdIdx]) || fileEmbeddings[fdIdx][pos] == nil {
-					idx.persistStore(ctx)
 					return filesIndexed, chunksCreated, fmt.Errorf(
 						"missing embedding for %s (chunk %d): aborting batch to avoid storing a partial file",
 						fileData[fdIdx].file.Path, uncached[u].chunkIdx)
@@ -607,8 +673,6 @@ func (idx *Indexer) indexFilesBatched(
 	}
 
 	// Merge cached and fresh vectors, then replace each file's chunks.
-	// Deletes happen only after all embedding succeeded: an embed failure
-	// leaves the previous index intact instead of an empty file.
 	freshByFile := make([]map[int][]float32, len(fileData))
 	for u, ref := range uncached {
 		if freshByFile[ref.fdIndex] == nil {
@@ -627,33 +691,19 @@ func (idx *Indexer) indexFilesBatched(
 		}
 		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, vectors, now)
 		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
-			idx.persistStore(ctx)
 			return filesIndexed, chunksCreated, err
 		}
 		filesIndexed++
 		chunksCreated += len(chunks)
 	}
 
-	// Files that chunk to nothing (truncated to empty or whitespace-only)
-	// must not keep stale chunks or documents.
-	chunked := make(map[int]bool, len(fileData))
-	for _, fd := range fileData {
-		chunked[fd.fileIndex] = true
-	}
-	for i, file := range files {
-		if chunked[i] {
-			continue
-		}
-		log.Printf("Removing %s from index: file is now empty", file.Path)
-		if err := idx.RemoveFile(ctx, file.Path); err != nil {
-			idx.persistStore(ctx)
-			return filesIndexed, chunksCreated, err
-		}
-		filesIndexed++
-	}
-
 	return filesIndexed, chunksCreated, nil
 }
+
+// indexCommitGroupFiles bounds one commit group: embed a group of files of
+// this size at most, save it, persist, then the next group. An interrupted
+// scan resumes paying only for what was not yet saved.
+const indexCommitGroupFiles = 10
 
 // maxReChunkAttempts is the maximum number of times we'll try to re-chunk
 // before giving up on a file.
@@ -868,22 +918,43 @@ func (idx *Indexer) lookupCachedEmbeddings(ctx context.Context, filePath string,
 }
 
 // ReconcileStoredChunks verifies sidecar/document metadata against the
-// points actually in the store and repairs divergence:
+// points actually in the store and repairs divergence.
 //
-//   - points present for a file but absent from its document (e.g. a crash
-//     between upserting new points and deleting stale ones) are deleted;
-//   - documents listing chunks that are absent from the store are dropped,
-//     so the next scan re-queues the file (lookups hit the surviving
-//     vectors, keeping the re-index cheap).
+// For stores with bulk support (Qdrant) it scrolls the collection once —
+// IDs and file_path only, no vectors, no content — and:
+//   - drops documents whose expected points are missing or which have extra
+//     points, so the next scan re-queues them (re-queue reuses vectors
+//     through LookupByContentHash and pays nothing). Point IDs are compared,
+//     never the chunk_id payload, so legacy points match too. A crash
+//     between upsert and persist shows up as extra points and is repaired
+//     the same way instead of deleting freshly paid points.
+//   - arms a deferred sweep of the points that belong to no document
+//     (deleted/shrunk/ignored files from before the first run, when the
+//     sidecar was empty). The sweep runs only via SweepUnexpectedPoints,
+//     after a scan that completed without error.
 //
-// It runs once at watcher startup, before the initial scan. All access uses
-// only VectorStore interface methods, so it works for every backend.
+// Any scroll error aborts before dropping or arming anything: reconcile
+// never acts on a partial view. Stores without bulk support (GOB, mocks,
+// workspace prefix wrappers) keep the previous per-file verification.
+//
+// It runs once at watcher startup, before the initial scan.
 func (idx *Indexer) ReconcileStoredChunks(ctx context.Context) (int, error) {
+	idx.pendingSweep = nil
 	paths, err := idx.store.ListDocuments(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to list documents for reconcile: %w", err)
 	}
 
+	if bulk, ok := idx.store.(store.BulkReconcileStore); ok {
+		return idx.reconcileBulk(ctx, bulk, paths)
+	}
+	return idx.reconcilePerFile(ctx, paths)
+}
+
+// reconcilePerFile is the previous per-file verification, kept for stores
+// without bulk scroll support. All access uses only VectorStore interface
+// methods, so it works for every backend.
+func (idx *Indexer) reconcilePerFile(ctx context.Context, paths []string) (int, error) {
 	dropped := 0
 	for _, path := range paths {
 		doc, err := idx.store.GetDocument(ctx, path)
@@ -948,6 +1019,145 @@ func (idx *Indexer) ReconcileStoredChunks(ctx context.Context) (int, error) {
 	}
 
 	return dropped, nil
+}
+
+// reconcileBulk compares every sidecar document against one collection
+// scroll. Divergent documents are dropped for re-indexing; points that
+// belong to no surviving document are armed for the post-scan sweep.
+// Nothing is deleted here.
+func (idx *Indexer) reconcileBulk(ctx context.Context, bulk store.BulkReconcileStore, paths []string) (int, error) {
+	start := time.Now()
+	refs, err := bulk.ListPointRefs(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to scroll collection for reconcile: %w", err)
+	}
+	byID := make(map[string]string, len(refs))
+	byFile := make(map[string]map[string]bool)
+	for _, r := range refs {
+		byID[r.PointID] = r.FilePath
+		set := byFile[r.FilePath]
+		if set == nil {
+			set = make(map[string]bool)
+			byFile[r.FilePath] = set
+		}
+		set[r.PointID] = true
+	}
+
+	dropped := 0
+	expected := make(map[string]bool)
+	for _, path := range paths {
+		doc, err := idx.store.GetDocument(ctx, path)
+		if err != nil {
+			log.Printf("Warning: reconcile: cannot read document for %s: %v (keeping entry)", path, err)
+			continue
+		}
+		if doc == nil {
+			continue
+		}
+		want := make(map[string]bool, len(doc.ChunkIDs))
+		for _, id := range doc.ChunkIDs {
+			want[store.PointIDForChunk(id)] = true
+		}
+
+		missing := false
+		for id := range want {
+			if _, ok := byID[id]; !ok {
+				missing = true
+				break
+			}
+		}
+		extra := false
+		for id := range byFile[path] {
+			if !want[id] {
+				extra = true
+				break
+			}
+		}
+		if missing || extra {
+			log.Printf("Reconcile: dropping document for %s (sidecar lists %d chunks): will re-index and reuse surviving vectors",
+				path, len(doc.ChunkIDs))
+			if err := idx.store.DeleteDocument(ctx, path); err != nil {
+				log.Printf("Warning: reconcile: failed to drop document for %s: %v", path, err)
+				continue
+			}
+			dropped++
+			continue
+		}
+		for id := range want {
+			expected[id] = true
+		}
+	}
+
+	var unexpected []string
+	for id := range byID {
+		if !expected[id] {
+			unexpected = append(unexpected, id)
+		}
+	}
+	idx.pendingSweep = &reconcileSweep{unexpected: unexpected, total: len(refs)}
+	log.Printf("Reconcile: scrolled %d points in %s, dropped %d document(s) for re-index, %d unexpected point(s) pending post-scan sweep",
+		len(refs), time.Since(start).Round(time.Millisecond), dropped, len(unexpected))
+	return dropped, nil
+}
+
+// SweepUnexpectedPoints deletes, once, the points that belonged to no
+// document when reconcile scrolled the collection, minus any the subsequent
+// scan adopted into new documents. Call it only after a scan that completed
+// without error: it is disarmed when the scroll failed, it never runs for
+// workspace prefix wrappers, and it removes nothing — loudly — when the
+// sweep would take more than half the collection.
+func (idx *Indexer) SweepUnexpectedPoints(ctx context.Context) (int, error) {
+	sw := idx.pendingSweep
+	idx.pendingSweep = nil
+	if sw == nil {
+		return 0, nil
+	}
+	if _, skip := idx.store.(interface{ SkipReconcile() }); skip {
+		return 0, nil
+	}
+	bulk, ok := idx.store.(store.BulkReconcileStore)
+	if !ok {
+		return 0, nil
+	}
+	if len(sw.unexpected) == 0 {
+		return 0, nil
+	}
+
+	// Re-check against current documents: the scan re-queued dropped files
+	// and their new documents may legitimately own these points now.
+	adopted := make(map[string]bool, len(sw.unexpected))
+	paths, err := idx.store.ListDocuments(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("sweep: failed to list documents: %w", err)
+	}
+	for _, path := range paths {
+		doc, err := idx.store.GetDocument(ctx, path)
+		if err != nil || doc == nil {
+			continue
+		}
+		for _, id := range doc.ChunkIDs {
+			adopted[store.PointIDForChunk(id)] = true
+		}
+	}
+	var doomed []string
+	for _, id := range sw.unexpected {
+		if !adopted[id] {
+			doomed = append(doomed, id)
+		}
+	}
+	if len(doomed) == 0 {
+		return 0, nil
+	}
+	if len(doomed)*2 > sw.total {
+		log.Printf("WARNING: reconcile sweep would remove %d of %d collection points (more than half); removing nothing",
+			len(doomed), sw.total)
+		return 0, nil
+	}
+	if err := bulk.DeletePointIDs(ctx, doomed); err != nil {
+		return 0, fmt.Errorf("sweep: failed to delete %d unexpected points: %w", len(doomed), err)
+	}
+	log.Printf("Reconcile: post-scan sweep removed %d unexpected point(s)", len(doomed))
+	return len(doomed), nil
 }
 
 // RemoveFile removes a file from the index

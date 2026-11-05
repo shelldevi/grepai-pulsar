@@ -110,6 +110,14 @@ func runWatch(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--dry-run does not support workspace mode; run it per project directory")
 	}
 
+	// Dry run takes its path first: before daemon checks (which can unlink
+	// stale PID files), UI selection (which would start the real watcher on
+	// a TTY), PID writes and any store/config writes. It must work while a
+	// live watcher runs on the same project.
+	if watchDryRun {
+		return runWatchDryRunFromCwd()
+	}
+
 	// Determine log directory
 	logDir := watchLogDir
 	if logDir == "" {
@@ -1037,6 +1045,22 @@ func isMissingCollectionErr(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "read-only mode, refusing to create it")
 }
 
+// runWatchDryRunFromCwd resolves the project from the current directory and
+// runs the dry-run preview. Used by runWatch so --dry-run never reaches the
+// daemon checks, UI selection or PID handling.
+func runWatchDryRunFromCwd() error {
+	ctx := context.Background()
+	projectRoot, err := config.FindProjectRoot()
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+	return runWatchDryRun(ctx, projectRoot, cfg, os.Getenv("GREPAI_BACKGROUND") == "1")
+}
+
 // runWatchDryRun previews the next scan: which files would be embedded,
 // how many chunks hit the cache, and the estimated token cost. It performs
 // no embedding and no writes of any kind (no store writes, no sidecar
@@ -1057,9 +1081,14 @@ func runWatchDryRun(ctx context.Context, projectRoot string, cfg *config.Config,
 			return err
 		}
 		log.Printf("Dry run: collection does not exist yet, previewing full initial index")
+		// Memory-only: it is never Loaded, Persisted or Closed, so no
+		// .lock, index or sidecar file is created anywhere.
 		st = store.NewGOBStore("")
 	}
-	defer st.Close()
+	// NOTE: no st.Close() here. Closing a GOB store persists it (creating
+	// .lock/index files), and dry-run must not write anywhere. The Qdrant
+	// closer is a no-op and the store holds no resources needing release
+	// for a preview.
 
 	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, cfg.Ignore, cfg.ExternalGitignore)
 	if err != nil {
@@ -1245,6 +1274,14 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 		if err := cfg.Save(projectRoot); err != nil {
 			log.Printf("Warning: failed to save config: %v", err)
 		}
+	}
+
+	// Sweep the unexpected points armed by reconcile, once, now that the
+	// scan completed without error. Never runs when the scroll failed.
+	if swept, serr := idx.SweepUnexpectedPoints(ctx); serr != nil {
+		log.Printf("Warning: post-scan sweep failed for %s: %v", projectRoot, serr)
+	} else if swept > 0 {
+		log.Printf("Reconcile: post-scan sweep removed %d unexpected point(s) for %s", swept, projectRoot)
 	}
 
 	if rpgEncoder != nil {
@@ -1972,6 +2009,21 @@ func runWatchForeground() error {
 	// Detect if running as background child process
 	isBackgroundChild := os.Getenv("GREPAI_BACKGROUND") == "1"
 
+	// Dry run never writes: take this path before the PID file handling
+	// below (GREPAI_BACKGROUND=1 would otherwise claim and release a PID,
+	// touching the log directory while a live watcher runs).
+	if watchDryRun {
+		projectRoot, err := config.FindProjectRoot()
+		if err != nil {
+			return err
+		}
+		cfg, err := config.Load(projectRoot)
+		if err != nil {
+			return fmt.Errorf("failed to load configuration: %w", err)
+		}
+		return runWatchDryRun(ctx, projectRoot, cfg, isBackgroundChild)
+	}
+
 	// If running in background, determine log directory and write PID file
 	var logDir string
 	var worktreeID string
@@ -2035,11 +2087,6 @@ func runWatchForeground() error {
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load configuration: %w", err)
-	}
-
-	// Dry run: preview only, no embedding, no writes, no watcher.
-	if watchDryRun {
-		return runWatchDryRun(ctx, projectRoot, cfg, isBackgroundChild)
 	}
 
 	if !isBackgroundChild {
@@ -2277,6 +2324,15 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			onStats(projectRoot, delta)
 		}
 
+		// Persist the sidecar BEFORE recording LastIndexTime, so a crash in
+		// between re-runs the scan instead of skipping a half-indexed file
+		// (which selectFilesForIndex would then skip by mtime while the
+		// sidecar still lists the old chunks).
+		if vectorStore != nil {
+			if err := vectorStore.Persist(ctx); err != nil {
+				log.Printf("Warning: failed to persist index for %s: %v", event.Path, err)
+			}
+		}
 		// Update last_index_time with throttling (only write if 30 seconds have passed)
 		now := time.Now()
 		if now.Sub(*lastConfigWrite) >= configWriteThrottle {

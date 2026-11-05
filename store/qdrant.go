@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -219,8 +220,7 @@ func SanitizeCollectionName(path string) string {
 }
 
 func (s *QdrantStore) getUUIDForChunk(chunkID string) uuid.UUID {
-	namespace := uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-	return uuid.NewSHA1(namespace, []byte(chunkID))
+	return uuid.NewSHA1(qdrantPointNamespace, []byte(chunkID))
 }
 
 func (s *QdrantStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
@@ -247,6 +247,9 @@ func (s *QdrantStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
 	_, err := s.client.Upsert(ctx, &qdrant.UpsertPoints{
 		CollectionName: s.collectionName,
 		Points:         points,
+		// Wait for acknowledgement: without it failures after the
+		// response are silent while the sidecar records success.
+		Wait: qdrant.PtrOf(true),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to upsert points: %w", err)
@@ -324,6 +327,9 @@ func (s *QdrantStore) DeleteByFile(ctx context.Context, filePath string) error {
 	_, err := s.client.Delete(ctx, &qdrant.DeletePoints{
 		CollectionName: s.collectionName,
 		Points:         qdrant.NewPointsSelectorFilter(filter),
+		// Wait for acknowledgement: without it failures after the
+		// response are silent while the sidecar records success.
+		Wait: qdrant.PtrOf(true),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete points: %w", err)
@@ -348,9 +354,84 @@ func (s *QdrantStore) DeleteChunksByIDs(ctx context.Context, chunkIDs []string) 
 	_, err := s.client.Delete(ctx, &qdrant.DeletePoints{
 		CollectionName: s.collectionName,
 		Points:         qdrant.NewPointsSelectorIDs(ids),
+		// Wait for acknowledgement: without it failures after the
+		// response are silent while the sidecar records success.
+		Wait: qdrant.PtrOf(true),
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete points by IDs: %w", err)
+	}
+
+	return nil
+}
+
+// ListPointRefs scrolls the whole collection returning every point's ID and
+// file_path only: no vectors, no content. One paged pass at startup instead
+// of one Scroll per file. Any page error aborts the whole list, so callers
+// can fail closed (remove nothing) instead of acting on a partial view.
+func (s *QdrantStore) ListPointRefs(ctx context.Context) ([]PointRef, error) {
+	const pageSize = 2000
+	var refs []PointRef
+	var offset *qdrant.PointId
+	for {
+		points, next, err := s.client.ScrollAndOffset(ctx, &qdrant.ScrollPoints{
+			CollectionName: s.collectionName,
+			Limit:          qdrant.PtrOf(uint32(pageSize)),
+			Offset:         offset,
+			WithPayload:    qdrant.NewWithPayloadInclude("file_path"),
+			WithVectors:    qdrant.NewWithVectors(false),
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to scroll collection %s: %w", s.collectionName, err)
+		}
+		for _, pt := range points {
+			id := ""
+			if pid := pt.GetId(); pid != nil {
+				id = pid.GetUuid()
+				if id == "" && pid.GetNum() != 0 {
+					id = strconv.FormatUint(pid.GetNum(), 10)
+				}
+			}
+			if id == "" {
+				return nil, fmt.Errorf("collection %s contains a point without a usable ID; refusing a partial reconcile view", s.collectionName)
+			}
+			filePath := ""
+			if val, ok := pt.Payload["file_path"]; ok {
+				filePath = val.GetStringValue()
+			}
+			refs = append(refs, PointRef{PointID: id, FilePath: filePath})
+		}
+		if next == nil {
+			break
+		}
+		offset = next
+	}
+	return refs, nil
+}
+
+// DeletePointIDs removes the points with the given collection point IDs
+// (UUID strings as returned by ListPointRefs), leaving all other points
+// untouched. Unlike DeleteChunksByIDs the IDs are used verbatim, so legacy
+// points without chunk_id payload are deletable too.
+func (s *QdrantStore) DeletePointIDs(ctx context.Context, pointIDs []string) error {
+	if len(pointIDs) == 0 {
+		return nil
+	}
+
+	ids := make([]*qdrant.PointId, 0, len(pointIDs))
+	for _, pid := range pointIDs {
+		ids = append(ids, qdrant.NewID(pid))
+	}
+
+	_, err := s.client.Delete(ctx, &qdrant.DeletePoints{
+		CollectionName: s.collectionName,
+		Points:         qdrant.NewPointsSelectorIDs(ids),
+		// Wait for acknowledgement: without it failures after the
+		// response are silent while the sweep reports success.
+		Wait: qdrant.PtrOf(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete %d points by IDs: %w", len(pointIDs), err)
 	}
 
 	return nil

@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Chunk represents a piece of code with its vector embedding
@@ -116,4 +118,31 @@ type EmbeddingCache interface {
 	// hash stored under the given file path.
 	// Returns (vector, true, nil) if found, (nil, false, nil) if not found.
 	LookupByContentHash(ctx context.Context, contentHash, filePath string) ([]float32, bool, error)
+}
+
+// PointRef identifies one stored point for reconcile: its collection point
+// ID and the file it belongs to. No vectors, no content.
+type PointRef struct {
+	PointID  string
+	FilePath string
+}
+
+// BulkReconcileStore is implemented by stores that can enumerate every point
+// ID cheaply (IDs and file paths only, no vectors or content) and delete
+// points by ID. Startup reconcile uses it to scan the collection once
+// instead of once per file.
+type BulkReconcileStore interface {
+	ListPointRefs(ctx context.Context) ([]PointRef, error)
+	DeletePointIDs(ctx context.Context, pointIDs []string) error
+}
+
+// qdrantPointNamespace is the UUIDv5 namespace mapping chunk IDs to
+// collection point IDs. Point IDs are deterministic in both versions, so
+// reconcile compares point IDs — never the chunk_id payload — and legacy
+// points without chunk_id still match.
+var qdrantPointNamespace = uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+// PointIDForChunk maps a chunk ID to its deterministic collection point ID.
+func PointIDForChunk(chunkID string) string {
+	return uuid.NewSHA1(qdrantPointNamespace, []byte(chunkID)).String()
 }
