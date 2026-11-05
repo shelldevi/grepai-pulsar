@@ -114,6 +114,21 @@ type FileMeta struct {
 	ModTime int64
 }
 
+// maxScanErrPaths caps the failing-path list: the count is exact, the list
+// is a sample for the operator (dry-run prints up to this many).
+const maxScanErrPaths = 20
+
+// ScanOutcome is the result of the metadata pass: files found, ordinary
+// skips, and the walk/stat errors that mark a scan incomplete. ErrPaths
+// names up to maxScanErrPaths failing paths in walk order; ErrCount is the
+// exact total.
+type ScanOutcome struct {
+	Files    []FileMeta
+	Skipped  []string
+	ErrCount int
+	ErrPaths []string
+}
+
 type Scanner struct {
 	root        string
 	ignore      *IgnoreMatcher
@@ -150,24 +165,43 @@ func (s *Scanner) logSkipSize(relPath string, size int64) {
 
 // ScanMetadata scans indexable files and returns only file metadata.
 // It avoids reading file contents and hash computation for a faster first pass.
-// The third return value counts walk/stat errors (unreadable entries): the
-// scan did not see everything, so callers must treat the result as partial
-// and delete nothing based on absence. Ordinary skips (ignored, unsupported,
-// minified, too large) are not errors.
-func (s *Scanner) ScanMetadata() ([]FileMeta, []string, int, error) {
-	var files []FileMeta
-	var skipped []string
-	scanErrs := 0
+// ScanMetadata scans indexable files and returns only file metadata.
+// It avoids reading file contents and hash computation for a faster first pass.
+// Walk/stat errors are counted and up to maxScanErrPaths of them named, so
+// callers can treat the result as partial: deletions based on absence must
+// be skipped for such a scan. Ordinary skips (ignored, unsupported,
+// minified, too large) are not errors. A file that vanished mid-scan is
+// absence, not an error.
+func (s *Scanner) ScanMetadata() (ScanOutcome, error) {
+	out := ScanOutcome{}
+
+	addErr := func(path string) {
+		out.ErrCount++
+		if len(out.ErrPaths) < maxScanErrPaths {
+			if rel, rerr := filepath.Rel(s.root, path); rerr == nil {
+				path = rel
+			}
+			out.ErrPaths = append(out.ErrPaths, path)
+		}
+	}
 
 	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			scanErrs++
+			// A file that vanished mid-scan is absence, not an error:
+			// agents edit constantly, and a deleted file must land in
+			// the gone set (subject to the usual guards), not mark the
+			// whole scan incomplete. Permission and I/O errors still
+			// count: the scan did not see everything.
+			if os.IsNotExist(err) {
+				return nil
+			}
+			addErr(path)
 			return nil // Skip files we can't access
 		}
 
 		relPath, err := filepath.Rel(s.root, path)
 		if err != nil {
-			scanErrs++
+			addErr(path)
 			return nil
 		}
 
@@ -192,24 +226,28 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, int, error) {
 
 		// Skip minified files
 		if isMinifiedFile(relPath) {
-			skipped = append(skipped, relPath+" (minified)")
+			out.Skipped = append(out.Skipped, relPath+" (minified)")
 			return nil
 		}
 
 		info, err := d.Info()
 		if err != nil {
-			scanErrs++
+			// Vanished mid-scan: absence, not an error (see above).
+			if os.IsNotExist(err) {
+				return nil
+			}
+			addErr(path)
 			return nil
 		}
 
 		// Skip large files
 		if info.Size() > s.maxFileSize {
 			s.logSkipSize(relPath, info.Size())
-			skipped = append(skipped, relPath+" (too large)")
+			out.Skipped = append(out.Skipped, relPath+" (too large)")
 			return nil
 		}
 
-		files = append(files, FileMeta{
+		out.Files = append(out.Files, FileMeta{
 			Path:    relPath,
 			Size:    info.Size(),
 			ModTime: info.ModTime().Unix(),
@@ -218,7 +256,7 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, int, error) {
 		return nil
 	})
 
-	return files, skipped, scanErrs, err
+	return out, err
 }
 
 func (s *Scanner) Scan() ([]FileInfo, []string, error) {
@@ -310,6 +348,11 @@ func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
 
 	info, err := os.Stat(absPath)
 	if err != nil {
+		// Deleted between the metadata pass and the read: absence, not
+		// an error. The caller leaves the file in the gone set.
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -320,6 +363,10 @@ func (s *Scanner) ScanFile(relPath string) (*FileInfo, error) {
 
 	content, err := os.ReadFile(absPath)
 	if err != nil {
+		// Deleted between stat and read: absence, not an error.
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 

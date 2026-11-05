@@ -1117,6 +1117,26 @@ func runWatchDryRun(ctx context.Context, projectRoot string, cfg *config.Config,
 	report("Files that would embed: %d; would remove: %d", stats.FilesToEmbed, stats.FilesRemoved)
 	report("Chunks cached: %d; chunks to embed: %d", stats.ChunksCached, stats.ChunksToEmbed)
 	report("Estimated tokens: %d (~%.1fM, ~$%.2f at $0.12/M)", stats.EstTokens, float64(stats.EstTokens)/1e6, float64(stats.EstTokens)/1e6*0.12)
+	if stats.ScanErrs > 0 {
+		report("Scan errors: %d (walk/stat/read — every scan stays incomplete until these clear, blocking gone-removal and the sweep):", stats.ScanErrs)
+		for _, p := range stats.ErrPaths {
+			report("  %s", p)
+		}
+		if len(stats.ErrPaths) < stats.ScanErrs {
+			report("  ... and %d more", stats.ScanErrs-len(stats.ErrPaths))
+		}
+	} else {
+		report("Scan errors: 0 (scan saw everything)")
+	}
+	if stats.SweepOK {
+		verdict := "guard would allow"
+		if stats.SweepGuarded {
+			verdict = "guard would REFUSE (over half)"
+		}
+		report("Post-scan sweep would remove: %d of %d points (%s)", stats.SweepPending, stats.SweepTotal, verdict)
+	} else {
+		report("Post-scan sweep preview: n/a (no collection yet or backend without bulk scroll)")
+	}
 	if len(stats.TopFiles) > 0 {
 		report("Top files by estimated tokens:")
 		for _, f := range stats.TopFiles {

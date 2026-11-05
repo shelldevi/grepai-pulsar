@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -114,6 +116,9 @@ type fileSelection struct {
 	// errCount counts walk/stat/read errors: the scan did not see
 	// everything, so deletions based on absence must be skipped this run.
 	errCount int
+	// errPaths names up to maxScanErrPaths failing paths (walk order, then
+	// read order), for the operator. errCount stays exact past the cap.
+	errPaths []string
 	// totalDocs is the number of documents listed before the scan, the
 	// denominator for the gone-removal over-half refusal.
 	totalDocs int
@@ -136,13 +141,14 @@ func (idx *Indexer) selectFilesForIndex(ctx context.Context, onProgress Progress
 	sel := &fileSelection{}
 
 	// Scan all files (metadata-only first pass)
-	fileMetas, skipped, scanErrs, err := idx.scanner.ScanMetadata()
+	scanOut, err := idx.scanner.ScanMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan files: %w", err)
 	}
-	sel.skipped = len(skipped)
-	sel.scannedFiles = fileMetas
-	sel.errCount = scanErrs
+	sel.skipped = len(scanOut.Skipped)
+	sel.scannedFiles = scanOut.Files
+	sel.errCount = scanOut.ErrCount
+	sel.errPaths = scanOut.ErrPaths
 
 	// Get existing documents
 	existingDocs, err := idx.store.ListDocuments(ctx)
@@ -157,13 +163,13 @@ func (idx *Indexer) selectFilesForIndex(ctx context.Context, onProgress Progress
 	}
 
 	// Filter files that need indexing
-	sel.filesToIndex = make([]FileInfo, 0, len(fileMetas))
-	for i, fileMeta := range fileMetas {
+	sel.filesToIndex = make([]FileInfo, 0, len(sel.scannedFiles))
+	for i, fileMeta := range sel.scannedFiles {
 		// Report progress for scanning phase
 		if onProgress != nil {
 			onProgress(ProgressInfo{
 				Current:     i + 1,
-				Total:       len(fileMetas),
+				Total:       len(sel.scannedFiles),
 				CurrentFile: fileMeta.Path,
 			})
 		}
@@ -190,14 +196,26 @@ func (idx *Indexer) selectFilesForIndex(ctx context.Context, onProgress Progress
 		file, err := idx.scanner.ScanFile(fileMeta.Path)
 		if err != nil {
 			// A stat/read error means the scan could not see everything:
-			// count it so this run deletes nothing based on absence.
+			// count it (naming the path, up to the shared cap) so this
+			// run deletes nothing based on absence.
 			log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
 			sel.skipped++
 			sel.errCount++
+			if len(sel.errPaths) < maxScanErrPaths {
+				sel.errPaths = append(sel.errPaths, fileMeta.Path)
+			}
 			delete(existingMap, fileMeta.Path)
 			continue
 		}
 		if file == nil {
+			// ScanFile returns nil both for excluded files (read
+			// directly: too large, binary, minified) and for files that
+			// vanished between the metadata pass and the read. Only the
+			// former is removed promptly; a vanished file is absence and
+			// belongs in the gone set, subject to the usual guards.
+			if _, serr := os.Stat(filepath.Join(idx.root, fileMeta.Path)); serr != nil && os.IsNotExist(serr) {
+				continue // stays in existingMap → gone
+			}
 			// Excluded since last index (too large, binary, minified).
 			sel.excludeNow = append(sel.excludeNow, fileMeta.Path)
 			delete(existingMap, fileMeta.Path)
@@ -343,6 +361,19 @@ type DryRunStats struct {
 	FilesSkipped  int
 	ScannedFiles  int
 	TopFiles      []DryRunFile
+	// ScanErrs counts walk/stat/read errors: a permanently unreadable path
+	// keeps every scan incomplete and blocks the sweep. ErrPaths names up
+	// to maxScanErrPaths of them.
+	ScanErrs int
+	ErrPaths []string
+	// SweepOK reports whether the post-scan sweep preview below was
+	// computed (bulk-scroll stores only). SweepPending/SweepTotal count
+	// the points the sweep would remove out of the collection size, and
+	// SweepGuarded whether the over-half guard would refuse it.
+	SweepOK      bool
+	SweepPending int
+	SweepTotal   int
+	SweepGuarded bool
 }
 
 // DryRunMaxTopFiles caps the per-file table in DryRunStats.
@@ -361,6 +392,32 @@ func (idx *Indexer) DryRun(ctx context.Context, onProgress ProgressCallback) (*D
 		FilesRemoved: len(sel.toRemove()),
 		FilesSkipped: sel.skipped,
 		ScannedFiles: len(sel.scannedFiles),
+		ScanErrs:     sel.errCount,
+		ErrPaths:     sel.errPaths,
+	}
+
+	if bulk, ok := idx.store.(store.BulkReconcileStore); ok {
+		refs, err := bulk.ListPointRefs(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("dry run: collection scroll failed: %w (preview aborts like the real pass)", err)
+		}
+		paths, err := idx.store.ListDocuments(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list documents: %w", err)
+		}
+		docs := make(map[string]*store.Document, len(paths))
+		for _, path := range paths {
+			doc, err := idx.store.GetDocument(ctx, path)
+			if err != nil || doc == nil {
+				continue
+			}
+			docs[path] = doc
+		}
+		unexpected := unexpectedPointIDs(refs, expectedPointIDs(docs))
+		stats.SweepOK = true
+		stats.SweepPending = len(unexpected)
+		stats.SweepTotal = len(refs)
+		stats.SweepGuarded = sweepGuardRefused(len(unexpected), len(refs))
 	}
 
 	cache, hasCache := idx.store.(store.EmbeddingCache)
@@ -1096,6 +1153,39 @@ func (idx *Indexer) reconcilePerFile(ctx context.Context, paths []string) (int, 
 	return dropped, nil
 }
 
+// expectedPointIDs unions the deterministic collection point IDs of the
+// given documents. Point IDs are compared, never the chunk_id payload, so
+// legacy points without chunk_id match too.
+func expectedPointIDs(docs map[string]*store.Document) map[string]bool {
+	expected := make(map[string]bool)
+	for _, doc := range docs {
+		if doc == nil {
+			continue
+		}
+		for _, id := range doc.ChunkIDs {
+			expected[store.PointIDForChunk(id)] = true
+		}
+	}
+	return expected
+}
+
+// unexpectedPointIDs returns the collection point IDs owned by no document.
+func unexpectedPointIDs(refs []store.PointRef, expected map[string]bool) []string {
+	var unexpected []string
+	for _, r := range refs {
+		if !expected[r.PointID] {
+			unexpected = append(unexpected, r.PointID)
+		}
+	}
+	return unexpected
+}
+
+// sweepGuardRefused reports whether removing nUnexpected of total points
+// trips the over-half guard: removal is refused loudly instead.
+func sweepGuardRefused(nUnexpected, total int) bool {
+	return total > 0 && nUnexpected*2 > total
+}
+
 // reconcileBulk compares every sidecar document against one collection
 // scroll. Divergent documents are dropped for re-indexing; points that
 // belong to no surviving document are armed for the post-scan sweep.
@@ -1119,7 +1209,7 @@ func (idx *Indexer) reconcileBulk(ctx context.Context, bulk store.BulkReconcileS
 	}
 
 	dropped := 0
-	expected := make(map[string]bool)
+	kept := make(map[string]*store.Document)
 	for _, path := range paths {
 		doc, err := idx.store.GetDocument(ctx, path)
 		if err != nil {
@@ -1158,17 +1248,10 @@ func (idx *Indexer) reconcileBulk(ctx context.Context, bulk store.BulkReconcileS
 			dropped++
 			continue
 		}
-		for id := range want {
-			expected[id] = true
-		}
+		kept[path] = doc
 	}
 
-	var unexpected []string
-	for id := range byID {
-		if !expected[id] {
-			unexpected = append(unexpected, id)
-		}
-	}
+	unexpected := unexpectedPointIDs(refs, expectedPointIDs(kept))
 	idx.pendingSweep = &reconcileSweep{unexpected: unexpected, total: len(refs)}
 	log.Printf("Reconcile: scrolled %d points in %s, dropped %d document(s) for re-index, %d unexpected point(s) pending post-scan sweep",
 		len(refs), time.Since(start).Round(time.Millisecond), dropped, len(unexpected))
@@ -1205,14 +1288,16 @@ func (idx *Indexer) SweepUnexpectedPoints(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("sweep: failed to list documents: %w", err)
 	}
+	docs := make(map[string]*store.Document, len(paths))
 	for _, path := range paths {
 		doc, err := idx.store.GetDocument(ctx, path)
 		if err != nil || doc == nil {
 			continue
 		}
-		for _, id := range doc.ChunkIDs {
-			adopted[store.PointIDForChunk(id)] = true
-		}
+		docs[path] = doc
+	}
+	for id := range expectedPointIDs(docs) {
+		adopted[id] = true
 	}
 	var doomed []string
 	for _, id := range sw.unexpected {
@@ -1223,7 +1308,7 @@ func (idx *Indexer) SweepUnexpectedPoints(ctx context.Context) (int, error) {
 	if len(doomed) == 0 {
 		return 0, nil
 	}
-	if len(doomed)*2 > sw.total {
+	if sweepGuardRefused(len(doomed), sw.total) {
 		log.Printf("WARNING: reconcile sweep would remove %d of %d collection points (more than half); removing nothing",
 			len(doomed), sw.total)
 		return 0, nil

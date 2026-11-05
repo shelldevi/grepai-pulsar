@@ -223,11 +223,83 @@ func TestScanMetadata_CountsWalkErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	scanner := NewScanner(tmpDir, ignoreMatcher)
-	_, _, scanErrs, err := scanner.ScanMetadata()
+	out, err := scanner.ScanMetadata()
 	if err != nil {
 		t.Fatalf("ScanMetadata failed: %v", err)
 	}
-	if scanErrs == 0 {
+	if out.ErrCount == 0 {
 		t.Error("unreadable directory must be counted as a scan error")
+	}
+}
+
+// TestScanMetadata_VanishedFileNotCounted verifies R7: a dangling symlink
+// (deterministic ENOENT on the following read) is absence, not a counted
+// scan error. DirEntry.Info is lstat and still lists the link; ScanFile
+// follows it, finds nothing, and returns nil, nil.
+func TestScanMetadata_VanishedFileNotCounted(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "live.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tmpDir, "gone.go"), filepath.Join(tmpDir, "dead.go")); err != nil {
+		t.Fatal(err)
+	}
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := NewScanner(tmpDir, ignoreMatcher).ScanMetadata()
+	if err != nil {
+		t.Fatalf("ScanMetadata failed: %v", err)
+	}
+	if out.ErrCount != 0 {
+		t.Errorf("vanished file must not count as a scan error, got %d (%v)", out.ErrCount, out.ErrPaths)
+	}
+
+	fi, err := NewScanner(tmpDir, ignoreMatcher).ScanFile("dead.go")
+	if err != nil {
+		t.Errorf("ScanFile on a vanished path must return nil, nil — got err %v", err)
+	}
+	if fi != nil {
+		t.Errorf("ScanFile on a vanished path must return nil, nil — got %+v", fi)
+	}
+}
+
+// TestSelectFilesForIndex_VanishedGoesToGone verifies R7 end to end: a file
+// deleted between the metadata pass and the read lands in the gone set
+// (subject to guards), without marking the selection incomplete.
+func TestSelectFilesForIndex_VanishedGoesToGone(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "v.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	st := newMockStore()
+	st.documents["v.go"] = store.Document{Path: "v.go", Hash: "old", ChunkIDs: []string{"v.go_0"}}
+	st.documents["gone.go"] = store.Document{Path: "gone.go", Hash: "h", ChunkIDs: []string{"gone.go_0"}}
+	if err := os.Remove(filepath.Join(tmpDir, "v.go")); err != nil {
+		t.Fatal(err)
+	}
+	ignoreMatcher, err := NewIgnoreMatcher(tmpDir, []string{}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := &Indexer{root: tmpDir, store: st, chunker: NewChunker(64, 8), scanner: NewScanner(tmpDir, ignoreMatcher)}
+	sel, err := idx.selectFilesForIndex(ctx, nil)
+	if err != nil {
+		t.Fatalf("selectFilesForIndex failed: %v", err)
+	}
+	if sel.Incomplete() {
+		t.Errorf("vanished file must not mark the selection incomplete (errs=%d)", sel.errCount)
+	}
+	gone := map[string]bool{}
+	for _, p := range sel.gone {
+		gone[p] = true
+	}
+	if !gone["v.go"] || !gone["gone.go"] {
+		t.Errorf("both the vanished and the deleted file must be gone, got %v", sel.gone)
+	}
+	if len(sel.excludeNow) != 0 {
+		t.Errorf("vanished file must not take the excludeNow path, got %v", sel.excludeNow)
 	}
 }

@@ -92,13 +92,14 @@ func TestScanner_ScanMetadata(t *testing.T) {
 	}
 
 	scanner := NewScanner(tmpDir, ignoreMatcher)
-	files, skipped, scanErrs, err := scanner.ScanMetadata()
+	out, err := scanner.ScanMetadata()
 	if err != nil {
 		t.Fatalf("scan metadata failed: %v", err)
 	}
-	if scanErrs != 0 {
-		t.Fatalf("expected no scan errors, got %d", scanErrs)
+	if out.ErrCount != 0 {
+		t.Fatalf("expected no scan errors, got %d", out.ErrCount)
 	}
+	files, skipped := out.Files, out.Skipped
 
 	if len(files) != 1 {
 		t.Fatalf("expected 1 metadata file, got %d", len(files))
