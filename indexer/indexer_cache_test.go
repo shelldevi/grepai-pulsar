@@ -143,7 +143,7 @@ func TestIndexFilesBatched_PartialReuse(t *testing.T) {
 		st.lookupVecs[ci.ContentHash] = cachedVec(7)
 	}
 
-	n, c, err := idx.indexFilesBatched(ctx, []FileInfo{{Path: "file.go", Content: content, Hash: "h", ModTime: 1}}, emb, nil)
+	n, c, _, err := idx.indexFilesBatched(ctx, []FileInfo{{Path: "file.go", Content: content, Hash: "h", ModTime: 1}}, emb, nil)
 	if err != nil {
 		t.Fatalf("indexFilesBatched failed: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestIndexFilesBatched_LookupErrorAbortsWithoutPay(t *testing.T) {
 	emb := newMockBatchEmbedder()
 	idx := newCacheTestIndexer(st, emb)
 
-	_, _, err := idx.indexFilesBatched(ctx,
+	_, _, _, err := idx.indexFilesBatched(ctx,
 		[]FileInfo{{Path: "a.go", Content: "package a\n", Hash: "h1", ModTime: 1}},
 		emb, nil)
 	if err == nil {
@@ -232,7 +232,7 @@ func TestIndexFilesBatched_EmptyFileRemovesStaleState(t *testing.T) {
 	st.chunks["gone.go_0"] = store.Chunk{ID: "gone.go_0", FilePath: "gone.go", Content: "old", Vector: cachedVec(1)}
 	st.documents["gone.go"] = store.Document{Path: "gone.go", Hash: "oldhash", ChunkIDs: []string{"gone.go_0"}}
 
-	n, c, err := idx.indexFilesBatched(ctx, []FileInfo{
+	n, c, _, err := idx.indexFilesBatched(ctx, []FileInfo{
 		{Path: "gone.go", Content: "", Hash: "emptyhash", ModTime: 2},
 		{Path: "new.go", Content: "package new\n", Hash: "h2", ModTime: 2},
 	}, emb, nil)

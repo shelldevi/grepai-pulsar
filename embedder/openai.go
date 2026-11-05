@@ -189,11 +189,11 @@ func (e *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp openAIErrorResponse
-		if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
-			return nil, fmt.Errorf("OpenAI API error: %s", errResp.Error.Message)
-		}
-		return nil, fmt.Errorf("OpenAI returned status %d: %s", resp.StatusCode, string(body))
+		// Same classification as the batch path: a context-length error
+		// surfaces as *ContextLengthError so callers (notably the
+		// per-file re-chunking in embedWithReChunking) can recover
+		// instead of failing every restart on one oversized chunk.
+		return nil, handleEmbedErrorResponse(resp, body)
 	}
 
 	var result openAIEmbedResponse

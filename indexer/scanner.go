@@ -150,17 +150,24 @@ func (s *Scanner) logSkipSize(relPath string, size int64) {
 
 // ScanMetadata scans indexable files and returns only file metadata.
 // It avoids reading file contents and hash computation for a faster first pass.
-func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
+// The third return value counts walk/stat errors (unreadable entries): the
+// scan did not see everything, so callers must treat the result as partial
+// and delete nothing based on absence. Ordinary skips (ignored, unsupported,
+// minified, too large) are not errors.
+func (s *Scanner) ScanMetadata() ([]FileMeta, []string, int, error) {
 	var files []FileMeta
 	var skipped []string
+	scanErrs := 0
 
 	err := filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			scanErrs++
 			return nil // Skip files we can't access
 		}
 
 		relPath, err := filepath.Rel(s.root, path)
 		if err != nil {
+			scanErrs++
 			return nil
 		}
 
@@ -191,6 +198,7 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 
 		info, err := d.Info()
 		if err != nil {
+			scanErrs++
 			return nil
 		}
 
@@ -210,7 +218,7 @@ func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {
 		return nil
 	})
 
-	return files, skipped, err
+	return files, skipped, scanErrs, err
 }
 
 func (s *Scanner) Scan() ([]FileInfo, []string, error) {

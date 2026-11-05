@@ -1277,8 +1277,13 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	}
 
 	// Sweep the unexpected points armed by reconcile, once, now that the
-	// scan completed without error. Never runs when the scroll failed.
-	if swept, serr := idx.SweepUnexpectedPoints(ctx); serr != nil {
+	// scan completed without error. Never runs when the scroll failed, and
+	// never after an incomplete scan (R5: deletions based on absence need a
+	// scan that saw everything).
+	if stats.Incomplete {
+		log.Printf("Warning: skipping post-scan sweep for %s: scan was incomplete (%d files failed to index), deleting nothing based on absence",
+			projectRoot, stats.FailedFiles)
+	} else if swept, serr := idx.SweepUnexpectedPoints(ctx); serr != nil {
 		log.Printf("Warning: post-scan sweep failed for %s: %v", projectRoot, serr)
 	} else if swept > 0 {
 		log.Printf("Reconcile: post-scan sweep removed %d unexpected point(s) for %s", swept, projectRoot)

@@ -38,8 +38,16 @@ type IndexStats struct {
 	FilesSkipped  int
 	ChunksCreated int
 	FilesRemoved  int
-	Duration      time.Duration
-	ScannedFiles  []FileMeta // All files found during scan (for reuse by callers)
+	// FailedFiles counts files that could not be indexed (embed/save errors
+	// on the batch path fallback, per-file errors on the sequential path).
+	// A non-zero count marks the scan incomplete: see Incomplete.
+	FailedFiles int
+	// Incomplete reports that the scan could not see or index everything
+	// (walk/stat/read errors, per-file failures). Deletions based on absence
+	// (gone files, post-scan sweep) must be skipped for such a scan.
+	Incomplete   bool
+	Duration     time.Duration
+	ScannedFiles []FileMeta // All files found during scan (for reuse by callers)
 }
 
 // ProgressInfo contains progress information for indexing
@@ -103,6 +111,18 @@ type fileSelection struct {
 	gone         []string   // in the store but gone from disk (remove at end)
 	skipped      int        // skipped entries (too large, unchanged, errors)
 	scannedFiles []FileMeta // all files found during scan
+	// errCount counts walk/stat/read errors: the scan did not see
+	// everything, so deletions based on absence must be skipped this run.
+	errCount int
+	// totalDocs is the number of documents listed before the scan, the
+	// denominator for the gone-removal over-half refusal.
+	totalDocs int
+}
+
+// Incomplete reports whether the scan could not see everything. Either the
+// metadata pass hit walk/stat/read errors or a file failed to read.
+func (s *fileSelection) Incomplete() bool {
+	return s.errCount > 0
 }
 
 // toRemove returns every path the selection would delete.
@@ -116,18 +136,20 @@ func (idx *Indexer) selectFilesForIndex(ctx context.Context, onProgress Progress
 	sel := &fileSelection{}
 
 	// Scan all files (metadata-only first pass)
-	fileMetas, skipped, err := idx.scanner.ScanMetadata()
+	fileMetas, skipped, scanErrs, err := idx.scanner.ScanMetadata()
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan files: %w", err)
 	}
 	sel.skipped = len(skipped)
 	sel.scannedFiles = fileMetas
+	sel.errCount = scanErrs
 
 	// Get existing documents
 	existingDocs, err := idx.store.ListDocuments(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list documents: %w", err)
 	}
+	sel.totalDocs = len(existingDocs)
 
 	existingMap := make(map[string]bool)
 	for _, doc := range existingDocs {
@@ -167,8 +189,11 @@ func (idx *Indexer) selectFilesForIndex(ctx context.Context, onProgress Progress
 		// Load file content and hash only after metadata filtering.
 		file, err := idx.scanner.ScanFile(fileMeta.Path)
 		if err != nil {
+			// A stat/read error means the scan could not see everything:
+			// count it so this run deletes nothing based on absence.
 			log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
 			sel.skipped++
+			sel.errCount++
 			delete(existingMap, fileMeta.Path)
 			continue
 		}
@@ -208,19 +233,11 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 	stats.FilesSkipped = sel.skipped
 	stats.ScannedFiles = sel.scannedFiles
+	stats.Incomplete = sel.Incomplete()
 	filesToIndex := sel.filesToIndex
 
-	// Drop newly-excluded files first, exactly where the old inline loop did.
-	for _, path := range sel.excludeNow {
-		log.Printf("Removing %s from index: file is now excluded (too large, binary or minified)", path)
-		if rerr := idx.RemoveFile(ctx, path); rerr != nil {
-			log.Printf("Failed to remove %s: %v", path, rerr)
-		} else {
-			stats.FilesRemoved++
-		}
-	}
-
-	// Drop newly-excluded files first, exactly where the old inline loop did.
+	// Drop newly-excluded files first. These were read directly (too large,
+	// binary, minified), so removal is safe even for an incomplete scan.
 	for _, path := range sel.excludeNow {
 		log.Printf("Removing %s from index: file is now excluded (too large, binary or minified)", path)
 		if rerr := idx.RemoveFile(ctx, path); rerr != nil {
@@ -231,12 +248,16 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 	// Index files using batch processing if available, otherwise sequentially
 	if batchEmbedder, ok := idx.embedder.(embedder.BatchEmbedder); ok && len(filesToIndex) > 0 {
-		indexed, chunks, err := idx.indexFilesBatched(ctx, filesToIndex, batchEmbedder, onBatchProgress)
+		indexed, chunks, failed, err := idx.indexFilesBatched(ctx, filesToIndex, batchEmbedder, onBatchProgress)
 		if err != nil {
 			return nil, err
 		}
 		stats.FilesIndexed = indexed
 		stats.ChunksCreated = chunks
+		stats.FailedFiles = failed
+		if failed > 0 {
+			stats.Incomplete = true
+		}
 	} else if len(filesToIndex) > 0 {
 		// Sequential indexing for non-batch embedders (e.g., Ollama)
 		total := len(filesToIndex)
@@ -251,7 +272,12 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			}
 			chunks, err := idx.IndexFile(ctx, file)
 			if err != nil {
+				// A per-file failure marks the scan incomplete (R5
+				// applies) instead of silently continuing towards
+				// absence-based deletions.
 				log.Printf("Failed to index %s: %v", file.Path, err)
+				stats.FailedFiles++
+				stats.Incomplete = true
 				continue
 			}
 			stats.FilesIndexed++
@@ -267,13 +293,29 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 	}
 
-	// Remove deleted files
-	for _, path := range sel.gone {
-		if err := idx.RemoveFile(ctx, path); err != nil {
-			log.Printf("Failed to remove %s: %v", path, err)
-			continue
+	// An incomplete scan deletes nothing based on absence: neither the gone
+	// files here nor the post-scan sweep (the caller skips it on
+	// stats.Incomplete). Indexing results above still stand.
+	if stats.Incomplete {
+		log.Printf("WARNING: scan of %s incomplete (%d walk/stat/read errors, %d files failed to index): deleting 0 gone files this run",
+			idx.root, sel.errCount, stats.FailedFiles)
+	} else {
+		// Refuse a gone-removal over half the known documents, same as the
+		// post-scan sweep guard: a missing mount must not wipe a collection
+		// even when no error was reported.
+		if len(sel.gone)*2 > sel.totalDocs {
+			log.Printf("WARNING: refusing to remove %d of %d indexed files (more than half) without a clean scan; removing nothing",
+				len(sel.gone), sel.totalDocs)
+		} else {
+			// Remove deleted files
+			for _, path := range sel.gone {
+				if err := idx.RemoveFile(ctx, path); err != nil {
+					log.Printf("Failed to remove %s: %v", path, err)
+					continue
+				}
+				stats.FilesRemoved++
+			}
 		}
-		stats.FilesRemoved++
 	}
 
 	stats.Duration = time.Since(start)
@@ -521,14 +563,14 @@ func (idx *Indexer) indexFilesBatched(
 	files []FileInfo,
 	batchEmb embedder.BatchEmbedder,
 	onProgress BatchProgressCallback,
-) (filesIndexed int, chunksCreated int, err error) {
+) (filesIndexed int, chunksCreated int, failedFiles int, err error) {
 	fileData, err := idx.prepareFileChunks(ctx, files)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 
 	if len(fileData) == 0 {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 
 	// Commit progress in bounded groups: embed one group, save it, persist,
@@ -540,15 +582,16 @@ func (idx *Indexer) indexFilesBatched(
 		if end > len(fileData) {
 			end = len(fileData)
 		}
-		fi, ch, gerr := idx.indexFileGroup(ctx, fileData[start:end], batchEmb, onProgress)
+		fi, ch, failed, gerr := idx.indexFileGroup(ctx, fileData[start:end], batchEmb, onProgress)
 		filesIndexed += fi
 		chunksCreated += ch
+		failedFiles += failed
 		// Persist completed groups so they survive a crash or a later
 		// group failing. Sidecar persists are dirty-gated, so this is
 		// cheap when nothing changed.
 		idx.persistStore(ctx)
 		if gerr != nil {
-			return filesIndexed, chunksCreated, gerr
+			return filesIndexed, chunksCreated, failedFiles, gerr
 		}
 	}
 
@@ -565,12 +608,12 @@ func (idx *Indexer) indexFilesBatched(
 		log.Printf("Removing %s from index: file is now empty", file.Path)
 		if err := idx.RemoveFile(ctx, file.Path); err != nil {
 			idx.persistStore(ctx)
-			return filesIndexed, chunksCreated, err
+			return filesIndexed, chunksCreated, failedFiles, err
 		}
 		filesIndexed++
 	}
 
-	return filesIndexed, chunksCreated, nil
+	return filesIndexed, chunksCreated, failedFiles, nil
 }
 
 // indexFileGroup embeds and saves one commit group of already-chunked files:
@@ -580,12 +623,16 @@ func (idx *Indexer) indexFilesBatched(
 // lookup failure aborts before any embedding call — it usually means the
 // store is unreachable, and embedding anyway would pay for vectors that then
 // fail to save.
+//
+// A context-length error falls back to the per-file path (which re-chunks
+// oversized chunks) for the group's files, so one poison chunk cannot block
+// the whole scan. Files that still fail are counted, never abort the group.
 func (idx *Indexer) indexFileGroup(
 	ctx context.Context,
 	fileData []fileChunkData,
 	batchEmb embedder.BatchEmbedder,
 	onProgress BatchProgressCallback,
-) (filesIndexed int, chunksCreated int, err error) {
+) (filesIndexed int, chunksCreated int, failedFiles int, err error) {
 	// Look up every chunk before touching the store: deletes happen only
 	// after all lookups succeed, so lookups can still hit the vectors that
 	// are about to be replaced.
@@ -607,7 +654,7 @@ func (idx *Indexer) indexFileGroup(
 				}
 				vec, found, err := cache.LookupByContentHash(ctx, chunk.ContentHash, fd.file.Path)
 				if err != nil {
-					return filesIndexed, chunksCreated, fmt.Errorf(
+					return filesIndexed, chunksCreated, failedFiles, fmt.Errorf(
 						"embedding cache lookup failed for %s (chunk %d): %w — aborting batch before any paid embedding",
 						fd.file.Path, j, err)
 				}
@@ -656,14 +703,23 @@ func (idx *Indexer) indexFileGroup(
 		batches := embedder.FormBatches(remaining)
 		results, err := batchEmb.EmbedBatches(ctx, batches, wrapBatchProgress(onProgress))
 		if err != nil {
-			return filesIndexed, chunksCreated, fmt.Errorf("failed to embed batches: %w", err)
+			// One oversized chunk aborts the whole batch (and would abort
+			// every restart). Fall back to the per-file path, which
+			// re-chunks oversized chunks, for this group's files; keep
+			// what succeeds and continue with the next group.
+			if embedder.AsContextLengthError(err) != nil {
+				log.Printf("Batch embedding hit a context-length error for a group of %d files; falling back to per-file indexing with re-chunking", len(fileData))
+				fi, ch, failed := idx.indexGroupPerFile(ctx, fileData)
+				return fi, ch, failed, nil
+			}
+			return filesIndexed, chunksCreated, failedFiles, fmt.Errorf("failed to embed batches: %w", err)
 		}
 
 		fileEmbeddings := embedder.MapResultsToFiles(batches, results, len(fileData))
 		for fdIdx, us := range remainingPos {
 			for pos, u := range us {
 				if pos >= len(fileEmbeddings[fdIdx]) || fileEmbeddings[fdIdx][pos] == nil {
-					return filesIndexed, chunksCreated, fmt.Errorf(
+					return filesIndexed, chunksCreated, failedFiles, fmt.Errorf(
 						"missing embedding for %s (chunk %d): aborting batch to avoid storing a partial file",
 						fileData[fdIdx].file.Path, uncached[u].chunkIdx)
 				}
@@ -691,13 +747,32 @@ func (idx *Indexer) indexFileGroup(
 		}
 		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, vectors, now)
 		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
-			return filesIndexed, chunksCreated, err
+			return filesIndexed, chunksCreated, failedFiles, err
 		}
 		filesIndexed++
 		chunksCreated += len(chunks)
 	}
 
-	return filesIndexed, chunksCreated, nil
+	return filesIndexed, chunksCreated, failedFiles, nil
+}
+
+// indexGroupPerFile indexes each file of a commit group through the existing
+// single-file path, which re-chunks oversized chunks instead of failing the
+// scan. No second re-chunking implementation: this is IndexFile. Files that
+// still fail are logged and counted; the caller marks the scan incomplete so
+// absence-based deletions are skipped for this run.
+func (idx *Indexer) indexGroupPerFile(ctx context.Context, fileData []fileChunkData) (filesIndexed, chunksCreated, failedFiles int) {
+	for _, fd := range fileData {
+		chunks, err := idx.IndexFile(ctx, fd.file)
+		if err != nil {
+			log.Printf("Failed to index %s (per-file fallback): %v", fd.file.Path, err)
+			failedFiles++
+			continue
+		}
+		filesIndexed++
+		chunksCreated += chunks
+	}
+	return filesIndexed, chunksCreated, failedFiles
 }
 
 // indexCommitGroupFiles bounds one commit group: embed a group of files of
